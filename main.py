@@ -30,6 +30,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -488,10 +489,30 @@ async def init_db():
             "ALTER TABLE autoreply_rules ADD COLUMN buttons_json   TEXT    DEFAULT ''",
             "ALTER TABLE autoreply_rules ADD COLUMN schedule_start TEXT    DEFAULT ''",
             "ALTER TABLE autoreply_rules ADD COLUMN schedule_end   TEXT    DEFAULT ''",
+            # Расширенный антиспам
+            "ALTER TABLE accounts ADD COLUMN antispam_filter_links     INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN antispam_filter_forwards  INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN antispam_filter_stickers  INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN antispam_action           TEXT    DEFAULT 'block'",
+            "ALTER TABLE accounts ADD COLUMN antispam_warn_max         INTEGER DEFAULT 3",
         ]
         for sql in migrations:
             try: await db.execute(sql)
             except: pass
+
+        # Таблица белого списка антиспама
+        try:
+            await db.execute("""
+            CREATE TABLE IF NOT EXISTS antispam_whitelist(
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                peer_id    INTEGER NOT NULL,
+                peer_name  TEXT DEFAULT '',
+                peer_user  TEXT DEFAULT '',
+                UNIQUE(account_id, peer_id)
+            )
+            """)
+        except: pass
 
         # Миграция: пересоздаём msg_cache с UNIQUE constraint чтобы убрать дубли
         # Проверяем — если UNIQUE уже есть, пропускаем
@@ -571,6 +592,10 @@ class CM:
         self._broadcasts    : dict = {}
         # буферы альбомов для черновиков {(aid, chat_id, group_id): {'items': [], 'task': Task}}
         self._album_buf     : dict = {}
+        # счётчики предупреждений антиспама {(aid, sender_id): warn_count}
+        self._warn_counts   : dict = defaultdict(int)
+        # счётчики удалённых сообщений за нарушения (для отчётов) {(aid, sender_id): count}
+        self._deleted_spam  : dict = defaultdict(int)
 
     def set_bot(self, b): self.bot = b
 
@@ -589,7 +614,7 @@ class CM:
         c = TelegramClient(StringSession(acc['session_string']), API_ID, API_HASH,
             device_model="Samsung Galaxy S25 Ultra",
             system_version="Android 15",
-            app_version="11.4.1",
+            app_version="12.4.3",
             connection_retries=5,
             retry_delay=3,
             auto_reconnect=True,
@@ -789,45 +814,24 @@ class CM:
                                     await self._send_content(c, ev.chat_id, item,
                                                               reply_to=reply_to)
 
-                            if reply_to_id:
-                                # ── режим реплая ──
-                                # первый элемент: заменяем триггер редактированием (если текст)
-                                # или удаляем и отправляем как реплай (если медиа)
-                                first = items[0]
-                                rest  = items[1:]
-                                if first.get('type') == 'text':
-                                    raw_text  = first.get('text', '')
-                                    ents_json = first.get('entities', [])
-                                    try:
-                                        if ents_json:
-                                            tl_ents = _build_telethon_entities(ents_json)
-                                            await c.edit_message(ev.chat_id, ev.message.id,
-                                                                  raw_text,
-                                                                  formatting_entities=tl_ents,
-                                                                  link_preview=False)
-                                        else:
-                                            await c.edit_message(ev.chat_id, ev.message.id,
-                                                                  raw_text, parse_mode='html',
-                                                                  link_preview=False)
-                                    except Exception:
-                                        # если редактировать не вышло — удаляем и шлём новым
-                                        await ev.message.delete()
-                                        await _send_item(first, reply_to=reply_to_id)
-                                else:
-                                    # медиа нельзя подставить редактированием — удаляем и шлём
-                                    await ev.message.delete()
-                                    await _send_item(first, reply_to=reply_to_id)
-                                # остальные — новые сообщения-реплаи на то же сообщение
-                                for item in rest:
-                                    if len(items) > 1:
-                                        await asyncio.sleep(0.3)
-                                    await _send_item(item, reply_to=reply_to_id)
-                            else:
-                                # ── обычный режим: удаляем триггер, шлём всё ──
+                            # ── во всех режимах: сначала удаляем триггер ──
+                            try:
                                 await ev.message.delete()
-                                for item in items:
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.05)
+
+                            if reply_to_id:
+                                # ── режим реплая: все элементы отправляем как реплай ──
+                                for i, item in enumerate(items):
+                                    await _send_item(item, reply_to=reply_to_id)
+                                    if i < len(items) - 1:
+                                        await asyncio.sleep(0.3)
+                            else:
+                                # ── обычный режим: шлём все элементы подряд ──
+                                for i, item in enumerate(items):
                                     await _send_item(item)
-                                    if len(items) > 1:
+                                    if i < len(items) - 1:
                                         await asyncio.sleep(0.3)
                         except Exception as de:
                             log.debug(f"draft send: {de}")
@@ -1054,38 +1058,137 @@ class CM:
         except: pass
 
     async def _antispam(self, c, ev, acc):
+        """
+        Расширенный антиспам:
+        - счётчик сообщений за окно времени
+        - фильтр ссылок
+        - фильтр форвардов
+        - фильтр стикер-спама
+        - режим действия: block / delete / warn+block
+        - белый список
+        """
         aid = acc['id']
         sid = ev.sender_id
         if not sid: return
-        thr = acc.get('spam_threshold', 5)
-        win = acc.get('spam_window', 60)
+
+        # ── Проверка белого списка ──
+        wl = await db_get(
+            "SELECT id FROM antispam_whitelist WHERE account_id=? AND peer_id=?", (aid, sid)
+        )
+        if wl: return
+
+        msg     = ev.message
+        text    = (msg.message or '').lower()
+        thr     = acc.get('spam_threshold', 5)
+        win     = acc.get('spam_window', 60)
+        action  = acc.get('antispam_action', 'block') or 'block'
+        warn_max= int(acc.get('antispam_warn_max', 3) or 3)
+
+        f_links    = bool(acc.get('antispam_filter_links', 0))
+        f_forwards = bool(acc.get('antispam_filter_forwards', 0))
+        f_stickers = bool(acc.get('antispam_filter_stickers', 0))
+
+        sender = ev.sender
+
+        # ── Обнаружение нарушений (помимо частоты) ──
+        violation = None
+
+        if f_forwards and msg.fwd_from:
+            violation = 'форвард'
+
+        if f_links and not violation:
+            import re as _re
+            if _re.search(r'(https?://|t\.me/|@\w{4,}|www\.)', text):
+                violation = 'ссылка'
+
+        if f_stickers and not violation:
+            if getattr(msg, 'sticker', None):
+                violation = 'стикер-спам'
+
+        # ── Счётчик частоты ──
         q   = self.counters[aid][sid]
         now = time.time()
         q.append(now)
         while q and now - q[0] > win: q.popleft()
-        if len(q) >= thr:
+        if len(q) >= thr and not violation:
+            violation = f'{thr} сообщ за {win}с'
+
+        if not violation:
+            return
+
+        # ── Применяем действие ──
+        acc_row = await db_get("SELECT user_id FROM accounts WHERE id=?", (aid,))
+        name    = getattr(sender, 'first_name', '') if sender else str(sid)
+        uname   = getattr(sender, 'username', '') or '' if sender else ''
+
+        if action == 'delete':
+            # Просто удаляем сообщение, не блокируем
             try:
-                await c(BlockRequest(id=await ev.get_input_sender()))
-                sender = ev.sender
-                await db_run(
-                    "INSERT OR IGNORE INTO blacklist_cache(account_id,peer_id,peer_name,peer_user) VALUES(?,?,?,?)",
-                    (aid, sid,
-                     getattr(sender, 'first_name', '') if sender else '',
-                     getattr(sender, 'username', '') if sender else '')
-                )
-                q.clear()
-                acc_row = await db_get("SELECT user_id FROM accounts WHERE id=?", (aid,))
-                if self.bot and acc_row:
-                    name = getattr(sender, 'first_name', '') if sender else str(sid)
-                    try:
+                await msg.delete()
+                self._deleted_spam[(aid, sid)] += 1
+                deleted_count = self._deleted_spam[(aid, sid)]
+                if self.bot and acc_row and deleted_count % 5 == 1:
+                    who = f'@{uname}' if uname else f'<a href="tg://user?id={sid}">{name}</a>'
+                    await self.bot.send_message(
+                        acc_row['user_id'],
+                        f"🗑 <b>антиспам · удалено</b>\n\n{who}\n"
+                        f"причина: {violation}\n"
+                        f"всего удалено у этого пользователя: {deleted_count}",
+                        parse_mode='HTML'
+                    )
+            except: pass
+            return
+
+        elif action == 'warn+block':
+            # Предупреждаем N раз, затем блокируем
+            key = (aid, sid)
+            self._warn_counts[key] += 1
+            warns = self._warn_counts[key]
+            if warns < warn_max:
+                try:
+                    await msg.delete()
+                    await c.send_message(ev.chat_id,
+                        f"⚠️ предупреждение {warns}/{warn_max}: {violation}\n"
+                        f"при следующих нарушениях вы будете заблокированы"
+                    )
+                    if self.bot and acc_row:
+                        who = f'@{uname}' if uname else f'<a href="tg://user?id={sid}">{name}</a>'
                         await self.bot.send_message(
                             acc_row['user_id'],
-                            f"🛡 <b>антиспам</b>\n\nзаблокирован: <b>{name}</b>\n"
-                            f"причина: {thr} сообщ за {win} сек",
+                            f"⚠️ <b>антиспам · предупреждение</b> {warns}/{warn_max}\n\n"
+                            f"{who}\nпричина: {violation}",
                             parse_mode='HTML'
                         )
-                    except: pass
-            except: pass
+                except: pass
+                return
+            else:
+                # Исчерпаны предупреждения — блокируем
+                self._warn_counts.pop(key, None)
+
+        # action == 'block' или warn_max исчерпан — блокируем
+        try:
+            await c(BlockRequest(id=await ev.get_input_sender()))
+            await db_run(
+                "INSERT OR IGNORE INTO blacklist_cache(account_id,peer_id,peer_name,peer_user) "
+                "VALUES(?,?,?,?)",
+                (aid, sid, name, uname)
+            )
+            q.clear()
+            self._warn_counts.pop((aid, sid), None)
+            self._deleted_spam.pop((aid, sid), None)
+
+            if self.bot and acc_row:
+                who  = f'@{uname}' if uname else f'<a href="tg://user?id={sid}">{name}</a>'
+                text_notify = (
+                    f"🛡 <b>антиспам · заблокирован</b>\n\n"
+                    f"{who}\nпричина: {violation}"
+                )
+                if action == 'warn+block':
+                    text_notify += f"\n(исчерпаны предупреждения: {warn_max}/{warn_max})"
+                try:
+                    await self.bot.send_message(acc_row['user_id'], text_notify, parse_mode='HTML')
+                except: pass
+        except: pass
 
     async def _autoreply(self, c, ev, aid):
         import json as _json
@@ -1692,7 +1795,38 @@ def main_kb():
 router = Router()
 _auth_clients: dict = {}  # user_id -> TelegramClient (kept alive between send_code and sign_in)
 
-# ── Rate limiter (защита от флуда к боту) ──
+# ── Access Guard Middleware — защита от несанкционированного доступа ──
+from typing import Callable, Any
+class AccessGuardMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable,
+        event: Any,
+        data: dict,
+    ) -> Any:
+        # Получаем user_id из event
+        user = getattr(event, 'from_user', None)
+        if not user:
+            return  # неизвестный источник — игнорируем
+        uid = user.id
+
+        # Проверка whitelist
+        if not _is_allowed(uid):
+            log.warning(f"Unauthorized access from user_id={uid}")
+            return  # молча игнорируем
+
+        # Проверка rate limit
+        if not _check_rate_limit(uid):
+            # Отвечаем только на Message и CallbackQuery
+            if isinstance(event, CallbackQuery):
+                try: await event.answer("⚠️ слишком много запросов, подождите", show_alert=True)
+                except: pass
+            elif isinstance(event, Message):
+                try: await event.answer("⚠️ слишком много запросов, подождите немного")
+                except: pass
+            return
+
+        return await handler(event, data)
 _rate_counters: dict = defaultdict(lambda: deque())
 _RATE_LIMIT_MSGS = 20   # максимум сообщений
 _RATE_LIMIT_WINDOW = 10  # за N секунд
@@ -1714,13 +1848,6 @@ def _is_allowed(user_id: int) -> bool:
 
 @router.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
-    uid = msg.from_user.id
-    if not _is_allowed(uid):
-        log.warning(f"Unauthorized access attempt from user_id={uid}")
-        return
-    if not _check_rate_limit(uid):
-        await msg.answer("⚠️ слишком много запросов, подождите немного")
-        return
     await state.clear()
     if msg.from_user.id in _auth_clients:
         try: await _auth_clients.pop(msg.from_user.id).disconnect()
@@ -1736,13 +1863,6 @@ async def cmd_start(msg: Message, state: FSMContext):
 
 @router.callback_query(F.data == "main")
 async def cb_main(cb: CallbackQuery, state: FSMContext):
-    uid = cb.from_user.id
-    if not _is_allowed(uid):
-        await cb.answer("❌ нет доступа", show_alert=True)
-        return
-    if not _check_rate_limit(uid):
-        await cb.answer("⚠️ подождите немного", show_alert=True)
-        return
     await state.clear()
     if cb.from_user.id in _auth_clients:
         try: await _auth_clients.pop(cb.from_user.id).disconnect()
@@ -1889,7 +2009,7 @@ async def cb_s_prot(cb: CallbackQuery):
     await edit(cb, "🛡 <b>защита аккаунта</b>",
         kb(
             [b(f"🔒 антиспам {sec}", f"sec_toggle:{aid}")],
-            [b("⚙️ порог спама",       f"sec_thr:{aid}")],
+            [b("⚙️ настройки антиспама", f"spam_cfg:{aid}:menu")],
             [b("🔍 проверить аккаунт", f"chk:{aid}")],
             [b("‹ назад",              f"acc:{aid}")]
         )
@@ -2081,7 +2201,7 @@ async def auth_phone(msg: Message, state: FSMContext):
         StringSession(), API_ID, API_HASH,
         device_model="Samsung Galaxy S25 Ultra",
         system_version="Android 15",
-        app_version="11.4.1",
+        app_version="12.4.3",
         lang_code="ru",
         system_lang_code="ru-RU",
         connection_retries=5,
@@ -2153,7 +2273,7 @@ async def auth_phone(msg: Message, state: FSMContext):
                     StringSession(), API_ID, API_HASH,
                     device_model="Samsung Galaxy S25 Ultra",
                     system_version="Android 15",
-                    app_version="11.4.1",
+                    app_version="12.4.3",
                     lang_code="ru",
                     system_lang_code="ru-RU",
                 )
@@ -2904,43 +3024,193 @@ async def cb_unread_readall(cb: CallbackQuery):
 # ══════════════════════════════════════
 # АНТИСПАМ
 # ══════════════════════════════════════
-@router.callback_query(F.data.startswith("sec_thr:"))
-async def cb_sec_thr(cb: CallbackQuery, state: FSMContext):
-    aid = int(cb.data.split(":")[1])
-    acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+# ══════════════════════════════════════
+# ⚙️ НАСТРОЙКИ АНТИСПАМА (расширенные)
+# ══════════════════════════════════════
+def _spam_cfg_kb(aid, acc):
+    """Строит клавиатуру меню антиспама."""
+    fl  = "✅" if acc.get('antispam_filter_links', 0)    else "☐"
+    ff  = "✅" if acc.get('antispam_filter_forwards', 0) else "☐"
+    fs  = "✅" if acc.get('antispam_filter_stickers', 0) else "☐"
+    act = acc.get('antispam_action', 'block') or 'block'
+    act_labels = {'block': '🚫 блок', 'delete': '🗑 удал', 'warn+block': '⚠️ пред+блок'}
+    act_lbl = act_labels.get(act, act)
     thr = acc.get('spam_threshold', 5)
     win = acc.get('spam_window', 60)
-    await state.set_state(SpamCfg.value)
-    await state.update_data(aid=aid, msg_id=cb.message.message_id, chat_id=cb.message.chat.id)
-    await edit(cb,
-        f"⚙️ <b>порог антиспама</b>\n\n"
-        f"текущий: <b>{thr} сообщ / {win} сек</b>\n\n"
-        f"формат: <code>N:сек</code>\nпример: <code>5:60</code>",
-        kb([b("отмена", f"s_prot:{aid}")])
+    wm  = acc.get('antispam_warn_max', 3)
+    return kb(
+        [b(f"{fl} ссылки",   f"spam_cfg:{aid}:tog:links"),
+         b(f"{ff} форварды", f"spam_cfg:{aid}:tog:forwards")],
+        [b(f"{fs} стикеры",  f"spam_cfg:{aid}:tog:stickers")],
+        [b(f"⚡ действие: {act_lbl}", f"spam_cfg:{aid}:action")],
+        [b(f"📊 порог: {thr} сообщ / {win}с", f"spam_cfg:{aid}:threshold")],
+        [b(f"⚠️ предупреждений до блока: {wm}", f"spam_cfg:{aid}:warnmax")],
+        [b("👥 белый список", f"spam_cfg:{aid}:wl:0")],
+        [b("‹ назад", f"s_prot:{aid}")]
     )
 
+@router.callback_query(F.data.startswith("spam_cfg:"))
+async def cb_spam_cfg(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    parts  = cb.data.split(":")
+    aid    = int(parts[1])
+    action = parts[2] if len(parts) > 2 else "menu"
+    acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
+    if not acc: return
+
+    if action == "menu":
+        await edit(cb, "⚙️ <b>настройки антиспама</b>\n\nФильтры срабатывают дополнительно к порогу частоты", _spam_cfg_kb(aid, acc))
+
+    elif action == "tog":
+        field_map = {
+            'links':    'antispam_filter_links',
+            'forwards': 'antispam_filter_forwards',
+            'stickers': 'antispam_filter_stickers',
+        }
+        key = parts[3] if len(parts) > 3 else ''
+        col = field_map.get(key)
+        if col:
+            new = 0 if acc.get(col, 0) else 1
+            await db_run(f"UPDATE accounts SET {col}=? WHERE id=?", (new, aid))
+            acc2 = await db_get("SELECT * FROM accounts WHERE id=?", (aid,))
+            try: await cb.message.edit_reply_markup(reply_markup=_spam_cfg_kb(aid, acc2))
+            except: pass
+
+    elif action == "action":
+        # Циклически: block → delete → warn+block → block
+        cur   = acc.get('antispam_action', 'block') or 'block'
+        order = ['block', 'delete', 'warn+block']
+        nxt   = order[(order.index(cur) + 1) % len(order)] if cur in order else 'block'
+        await db_run("UPDATE accounts SET antispam_action=? WHERE id=?", (nxt, aid))
+        acc2 = await db_get("SELECT * FROM accounts WHERE id=?", (aid,))
+        try: await cb.message.edit_reply_markup(reply_markup=_spam_cfg_kb(aid, acc2))
+        except: pass
+
+    elif action == "threshold":
+        await state.set_state(SpamCfg.value)
+        await state.update_data(aid=aid, msg_id=cb.message.message_id,
+                                chat_id=cb.message.chat.id, spam_field='threshold')
+        thr = acc.get('spam_threshold', 5)
+        win = acc.get('spam_window', 60)
+        await edit(cb,
+            f"📊 <b>порог частоты</b>\n\n"
+            f"текущий: <b>{thr} сообщ за {win} сек</b>\n\n"
+            f"формат: <code>кол-во:секунды</code>\nпример: <code>5:60</code>",
+            kb([b("отмена", f"spam_cfg:{aid}:menu")])
+        )
+
+    elif action == "warnmax":
+        await state.set_state(SpamCfg.value)
+        await state.update_data(aid=aid, msg_id=cb.message.message_id,
+                                chat_id=cb.message.chat.id, spam_field='warnmax')
+        wm = acc.get('antispam_warn_max', 3)
+        await edit(cb,
+            f"⚠️ <b>предупреждений до блока</b>\n\n"
+            f"текущее: <b>{wm}</b>\n\n"
+            f"введите число (1–10):",
+            kb([b("отмена", f"spam_cfg:{aid}:menu")])
+        )
+
+    elif action == "wl":
+        page = int(parts[3]) if len(parts) > 3 else 0
+        wl   = await db_all("SELECT * FROM antispam_whitelist WHERE account_id=?", (aid,))
+        if not wl:
+            await edit(cb,
+                "👥 <b>белый список антиспама</b>\n\nПуст — все проверяются.\n\n"
+                "Добавленные пользователи не будут подпадать под фильтры.",
+                kb([b("➕ добавить", f"spam_cfg:{aid}:wl_add"),
+                    b("‹ назад", f"spam_cfg:{aid}:menu")])
+            ); return
+        chunk, page, pages = paginate(wl, page, 5)
+        lines = [f"👥 <b>белый список</b>  ·  {len(wl)} чел\n"]
+        rows  = []
+        for u in chunk:
+            tag  = f"@{u['peer_user']}" if u['peer_user'] else f"id:{u['peer_id']}"
+            name = (u['peer_name'] or '—')[:20]
+            lines.append(f"✅ {name}  <code>{tag}</code>")
+            rows.append([b(f"🗑 {name}", f"spam_cfg:{aid}:wl_del:{u['id']}")])
+        if pages > 1: rows.append(nav(page, pages, f"spam_cfg:{aid}:wl"))
+        rows += [[b("➕ добавить", f"spam_cfg:{aid}:wl_add"),
+                  b("‹ назад", f"spam_cfg:{aid}:menu")]]
+        await edit(cb, "\n".join(lines), kb(*rows))
+
+    elif action == "wl_del":
+        wid = int(parts[3])
+        await db_run("DELETE FROM antispam_whitelist WHERE id=? AND account_id=?", (wid, aid))
+        cb.data = f"spam_cfg:{aid}:wl:0"
+        await cb_spam_cfg(cb, state)
+
+    elif action == "wl_add":
+        await state.set_state(SpamCfg.value)
+        await state.update_data(aid=aid, msg_id=cb.message.message_id,
+                                chat_id=cb.message.chat.id, spam_field='wl_add')
+        await edit(cb,
+            "👥 <b>добавить в белый список</b>\n\nВведите @username или числовой ID:",
+            kb([b("отмена", f"spam_cfg:{aid}:wl:0")])
+        )
+
+
 @router.message(SpamCfg.value)
-async def spam_thr_msg(msg: Message, state: FSMContext):
+async def spam_cfg_msg(msg: Message, state: FSMContext):
     await delete_user_msg(msg)
-    data = await state.get_data()
-    aid  = data['aid']; mid = data['msg_id']; cid = data['chat_id']
+    data  = await state.get_data()
+    aid   = data['aid']; mid = data['msg_id']; cid = data['chat_id']
+    field = data.get('spam_field', 'threshold')
+
     async def upd(text, markup):
         try: await msg.bot.edit_message_text(text, chat_id=cid, message_id=mid,
                                               reply_markup=markup, parse_mode='HTML')
         except: pass
-    try:
-        parts = msg.text.strip().split(':')
-        thr   = int(parts[0])
-        win   = int(parts[1]) if len(parts) > 1 else 60
-        if thr < 1 or win < 1: raise ValueError
-        await db_run("UPDATE accounts SET spam_threshold=?, spam_window=? WHERE id=?", (thr, win, aid))
-        await state.clear()
-        await upd(f"✅ порог обновлён: <b>{thr} сообщ / {win} сек</b>",
-                  kb([b("‹ назад", f"s_prot:{aid}")]))
-    except:
-        await upd(f"❌ неверный формат, пример: <code>5:60</code>",
-                  kb([b("отмена", f"s_prot:{aid}")]))
+
+    if field == 'threshold':
+        try:
+            parts = (msg.text or '').strip().split(':')
+            thr   = int(parts[0])
+            win   = int(parts[1]) if len(parts) > 1 else 60
+            if thr < 1 or win < 1: raise ValueError
+            await db_run("UPDATE accounts SET spam_threshold=?, spam_window=? WHERE id=?",
+                         (thr, win, aid))
+            await state.clear()
+            await upd(f"✅ порог: <b>{thr} сообщ / {win} сек</b>",
+                      kb([b("‹ назад", f"spam_cfg:{aid}:menu")]))
+        except:
+            await upd("❌ неверный формат, пример: <code>5:60</code>",
+                      kb([b("отмена", f"spam_cfg:{aid}:menu")]))
+
+    elif field == 'warnmax':
+        try:
+            val = int((msg.text or '').strip())
+            if not (1 <= val <= 10): raise ValueError
+            await db_run("UPDATE accounts SET antispam_warn_max=? WHERE id=?", (val, aid))
+            await state.clear()
+            await upd(f"✅ предупреждений до блока: <b>{val}</b>",
+                      kb([b("‹ назад", f"spam_cfg:{aid}:menu")]))
+        except:
+            await upd("❌ введите число от 1 до 10",
+                      kb([b("отмена", f"spam_cfg:{aid}:menu")]))
+
+    elif field == 'wl_add':
+        raw = (msg.text or '').strip().lstrip('@')
+        c   = cm.get(aid)
+        if c and raw:
+            try:
+                entity = await c.get_entity(raw)
+                pid    = entity.id
+                pname  = getattr(entity, 'first_name', '') or getattr(entity, 'title', '') or raw
+                pusr   = getattr(entity, 'username', '') or ''
+                await db_run(
+                    "INSERT OR IGNORE INTO antispam_whitelist(account_id,peer_id,peer_name,peer_user) "
+                    "VALUES(?,?,?,?)", (aid, pid, pname, pusr)
+                )
+                await state.clear()
+                await upd(f"✅ добавлен в белый список: <b>{pname}</b>",
+                          kb([b("‹ к белому списку", f"spam_cfg:{aid}:wl:0")]))
+            except Exception as e:
+                await upd(f"❌ не найден: {e}",
+                          kb([b("отмена", f"spam_cfg:{aid}:wl:0")]))
+        else:
+            await upd("❌ введите @username или ID",
+                      kb([b("отмена", f"spam_cfg:{aid}:wl:0")]))
 
 @router.callback_query(F.data.startswith("sec_toggle:"))
 async def cb_sec_toggle(cb: CallbackQuery):
@@ -2957,7 +3227,7 @@ async def cb_sec_toggle(cb: CallbackQuery):
             "🛡 <b>защита аккаунта</b>",
             reply_markup=kb(
                 [b(f"🔒 антиспам {sec}", f"sec_toggle:{aid}")],
-                [b("⚙️ порог спама",       f"sec_thr:{aid}")],
+                [b("⚙️ настройки антиспама", f"spam_cfg:{aid}:menu")],
                 [b("🔍 проверить аккаунт", f"chk:{aid}")],
                 [b("‹ назад",              f"acc:{aid}")]
             ), parse_mode='HTML'
@@ -4493,6 +4763,10 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
     dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    # Подключаем middleware безопасности ко всем входящим событиям
+    dp.message.middleware(AccessGuardMiddleware())
+    dp.callback_query.middleware(AccessGuardMiddleware())
 
     cm.set_bot(bot)
     await cm.load_all()
