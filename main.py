@@ -2548,6 +2548,22 @@ async def _bg_sync_all(aid: int):
 # ══════════════════════════════════════
 # СТАТИСТИКА
 # ══════════════════════════════════════
+def _fmt_num(n) -> str:
+    """Форматирует число: 1 234 567 → '1.2M', 12 345 → '12.3k', иначе как есть."""
+    if n is None: return '0'
+    n = int(n)
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n/1_000:.1f}k"
+    return str(n)
+
+
+def _bar(val: int, total: int, w: int = 8) -> str:
+    if not total: return '░' * w
+    filled = round(val / total * w)
+    filled = max(0, min(w, filled))
+    return '█' * filled + '░' * (w - filled)
+
+
 _STATS_PAGE = 8   # чатов на страницу
 
 
