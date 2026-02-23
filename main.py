@@ -2564,11 +2564,11 @@ def _bar(val: int, total: int, w: int = 8) -> str:
     return '█' * filled + '░' * (w - filled)
 
 
-_STATS_PAGE = 8   # чатов на страницу
+_STATS_PAGE = 8   # не используется напрямую, слайдер по 1 чату
 
 
 async def _live_analyze_stats(bot, cid: int, mid: int, aid: int) -> None:
-    """Полный живой анализ: обновляет сообщение в реальном времени по каждому чату."""
+    """Живой анализ: по каждому чату — запрашивает реальные данные из API."""
     c = cm.get(aid)
     if not c:
         return
@@ -2609,16 +2609,28 @@ async def _live_analyze_stats(bot, cid: int, mid: int, aid: int) -> None:
             )
 
             total_msgs = 0
+            inc_cnt    = 0
+            out_cnt    = 0
             voices_cnt = 0
             vn_cnt     = 0
             media_cnt  = 0
-            out_cnt    = 0
 
             try:
                 res = await c.get_messages(e, limit=0)
                 total_msgs = getattr(res, 'total', 0) or 0
             except Exception:
                 pass
+
+            # Входящие = сообщения ОТ собеседника (реальный API-счётчик)
+            try:
+                r_inc = await c.get_messages(e, limit=0, from_user=e)
+                inc_cnt = getattr(r_inc, 'total', 0) or 0
+                await asyncio.sleep(0.08)
+            except Exception:
+                pass
+
+            # Исходящие = всего − входящие
+            out_cnt = max(total_msgs - inc_cnt, 0)
 
             try:
                 rv = await c.get_messages(e, limit=0, filter=InputMessagesFilterVoice)
@@ -2632,14 +2644,6 @@ async def _live_analyze_stats(bot, cid: int, mid: int, aid: int) -> None:
                 await asyncio.sleep(0.08)
             except Exception:
                 pass
-
-            agg = await db_get(
-                "SELECT SUM(CASE WHEN is_outgoing=0 THEN 1 ELSE 0 END) as inc,"
-                "SUM(CASE WHEN is_outgoing=1 THEN 1 ELSE 0 END) as out "
-                "FROM msg_cache WHERE account_id=? AND chat_id=?",
-                (aid, d.id)
-            )
-            out_cnt = (agg or {}).get('out') or 0
 
             last_str = d.date.strftime('%d.%m.%Y  %H:%M') if d.date else ''
 
@@ -2677,7 +2681,10 @@ async def _live_analyze_stats(bot, cid: int, mid: int, aid: int) -> None:
 
 
 async def _render_stats(bot, cid: int, mid: int, aid: int, page: int) -> None:
-    """Рендерит красивую статистику из кэша."""
+    """
+    page=0  → сводка по всем чатам
+    page=N (N>=1) → слайдер: детальная карточка N-го чата (сортировка по total_msgs)
+    """
     rows_db = await db_all(
         "SELECT * FROM stats_cache WHERE account_id=? ORDER BY total_msgs DESC",
         (aid,)
@@ -2695,75 +2702,116 @@ async def _render_stats(bot, cid: int, mid: int, aid: int, page: int) -> None:
         return
 
     total_chats = len(rows_db)
-    total_msgs  = sum(r['total_msgs'] or 0 for r in rows_db)
-    total_unr   = sum(r['unread'] or 0 for r in rows_db)
-    total_voice = sum(r['voices'] or 0 for r in rows_db)
-    total_vn    = sum(r['videonotes'] or 0 for r in rows_db)
-    total_media = sum(r['media_count'] or 0 for r in rows_db)
-    total_out   = sum(r['out_msgs'] or 0 for r in rows_db)
-    total_inc   = max(total_msgs - total_out, 0)
+    page = max(0, min(page, total_chats))  # 0 = сводка, 1..N = чаты
 
-    pages = max(1, (total_chats + _STATS_PAGE - 1) // _STATS_PAGE)
-    page  = max(0, min(page, pages - 1))
-    chunk = rows_db[page * _STATS_PAGE : (page + 1) * _STATS_PAGE]
+    # ── СВОДКА (page=0) ──────────────────────────────────────────
+    if page == 0:
+        total_msgs  = sum(r['total_msgs'] or 0 for r in rows_db)
+        total_unr   = sum(r['unread'] or 0 for r in rows_db)
+        total_voice = sum(r['voices'] or 0 for r in rows_db)
+        total_vn    = sum(r['videonotes'] or 0 for r in rows_db)
+        total_media = sum(r['media_count'] or 0 for r in rows_db)
+        total_out   = sum(r['out_msgs'] or 0 for r in rows_db)
+        total_inc   = max(total_msgs - total_out, 0)
+        ts          = max(total_msgs, 1)
+        bar_in      = _bar(total_inc, ts, 8)
+        bar_out     = _bar(total_out, ts, 8)
+        pct_in      = int(total_inc / ts * 100)
+        pct_out     = int(total_out / ts * 100)
+
+        lines = [
+            "📊 <b>статистика переписки</b>\n",
+            f"👥 контактов:    <b>{_fmt_num(total_chats)}</b>",
+            f"💬 сообщений:    <b>{_fmt_num(total_msgs)}</b>",
+            f"",
+            f"📥 входящие:    <code>{bar_in}</code> <b>{_fmt_num(total_inc)}</b>  ({pct_in}%)",
+            f"📤 исходящие:   <code>{bar_out}</code> <b>{_fmt_num(total_out)}</b>  ({pct_out}%)",
+            f"",
+            f"🎙 голосовых:   <b>{_fmt_num(total_voice)}</b>",
+            f"🎥 кружков:     <b>{_fmt_num(total_vn)}</b>",
+            f"📎 медиа:       <b>{_fmt_num(total_media)}</b>",
+        ]
+        if total_unr:
+            lines.append(f"🔴 непрочит:    <b>{_fmt_num(total_unr)}</b>")
+
+        lines += [
+            f"",
+            f"<i>👉 листай чаты кнопками ниже</i>",
+        ]
+
+        rows = [
+            [b("👤 чаты ▶", f"stats:{aid}:1")],
+            [b("🏆 топ", f"stats_top:{aid}"), b("‹ назад", f"s_data:{aid}")],
+        ]
+        try:
+            await bot.edit_message_text(
+                "\n".join(lines), chat_id=cid, message_id=mid,
+                reply_markup=kb(*rows), parse_mode='HTML'
+            )
+        except Exception as ex:
+            log.debug(f"render_stats summary: {ex}")
+        return
+
+    # ── СЛАЙДЕР ЧАТА (page=1..N) ─────────────────────────────────
+    idx = page - 1  # индекс в rows_db (0-based)
+    r   = rows_db[idx]
+
+    name     = r['chat_name'] or '?'
+    username = r['username'] or ''
+    unread   = r['unread'] or 0
+    last     = r['last_date'] or '—'
+    total    = r['total_msgs'] or 0
+    out_c    = r['out_msgs'] or 0
+    inc_c    = max(total - out_c, 0)
+    voices   = r['voices'] or 0
+    vn       = r['videonotes'] or 0
+    media    = r['media_count'] or 0
+
+    ts      = max(total, 1)
+    pct_in  = int(inc_c / ts * 100)
+    pct_out = int(out_c / ts * 100)
+    bar_in  = _bar(inc_c, ts, 8)
+    bar_out = _bar(out_c, ts, 8)
+    med_pct = int((voices + vn + media) / ts * 100)
+
+    uname_ln = f"\n🔗 @{username}" if username else ""
+    unr_ln   = f"\n🔴 непрочитанных: <b>{unread}</b>" if unread else ""
+    pos_txt  = f"<b>{page} / {total_chats}</b>"
 
     lines = [
-        "📊 <b>статистика переписки</b>\n",
-        f"👥 контактов:         <b>{_fmt_num(total_chats)}</b>",
-        f"💬 всего сообщений:   <b>{_fmt_num(total_msgs)}</b>",
-        f"   📥 вход: <b>{_fmt_num(total_inc)}</b>  📤 исход: <b>{_fmt_num(total_out)}</b>",
-        f"🎙 голос: <b>{_fmt_num(total_voice)}</b>  🎥 кружки: <b>{_fmt_num(total_vn)}</b>  📎 медиа: <b>{_fmt_num(total_media)}</b>",
+        f"📊 <b>чат {pos_txt}</b>\n",
+        f"👤 <b>{name}</b>{uname_ln}{unr_ln}\n",
+        f"──────────────────",
+        f"💬 всего:     <b>{_fmt_num(total)}</b> сообщений\n",
+        f"📥 входящие:  <code>{bar_in}</code>",
+        f"   <b>{_fmt_num(inc_c)}</b>  ({pct_in}%)\n",
+        f"📤 исходящие: <code>{bar_out}</code>",
+        f"   <b>{_fmt_num(out_c)}</b>  ({pct_out}%)\n",
+        f"──────────────────",
+        f"🎙 голосовых:  <b>{_fmt_num(voices)}</b>",
+        f"🎥 кружков:    <b>{_fmt_num(vn)}</b>",
+        f"📎 фото/видео: <b>{_fmt_num(media)}</b>",
+        f"🖼 медиа:      <b>{med_pct}%</b> от переписки\n",
+        f"──────────────────",
+        f"🕐 последнее: {last}",
     ]
-    if total_unr:
-        lines.append(f"🔴 непрочитанных:     <b>{_fmt_num(total_unr)}</b>")
-    if pages > 1:
-        lines.append(f"\n<b>страница {page+1} / {pages}</b>")
-    lines.append("")
 
-    for r in chunk:
-        name  = (r['chat_name'] or '?')[:22]
-        cnt   = r['total_msgs'] or 0
-        out_c = r['out_msgs'] or 0
-        inc_c = max(cnt - out_c, 0)
-        unr   = r['unread'] or 0
-        last  = r['last_date'] or ''
-
-        unr_tag  = f"  🔴<b>{unr}</b>" if unr else ""
-        bar_in   = _bar(inc_c, cnt, 5)
-        bar_out  = _bar(out_c, cnt, 5)
-        extras   = []
-        if r.get('voices'):      extras.append(f"🎙{_fmt_num(r['voices'])}")
-        if r.get('videonotes'):  extras.append(f"🎥{_fmt_num(r['videonotes'])}")
-        if r.get('media_count'): extras.append(f"📎{_fmt_num(r['media_count'])}")
-        ext_str  = "  " + "  ".join(extras) if extras else ""
-        last_str = f"  🕐 {last}" if last else ""
-        lines += [
-            "──────────────────",
-            f"👤 <b>{name}</b>{unr_tag}",
-            f"💬 <code>{bar_in}</code> {_fmt_num(inc_c)} вх  <code>{bar_out}</code> {_fmt_num(out_c)} исх",
-        ]
-        if ext_str or last_str:
-            lines.append(f"{ext_str.strip()}{last_str}")
-
-    lines.append("──────────────────")
-
-    nav_btns = []
-    if page > 0:        nav_btns.append(b("◀", f"stats:{aid}:{page-1}"))
-    if page < pages-1:  nav_btns.append(b("▶", f"stats:{aid}:{page+1}"))
+    nav = []
+    if page > 1:           nav.append(b("◀", f"stats:{aid}:{page-1}"))
+    if page < total_chats: nav.append(b("▶", f"stats:{aid}:{page+1}"))
 
     rows = []
-    if nav_btns: rows.append(nav_btns)
-    rows.append([b("🏆 топ чатов", f"stats_top:{aid}")])
+    if nav: rows.append(nav)
+    rows.append([b("📊 сводка", f"stats:{aid}:0"), b("🏆 топ", f"stats_top:{aid}")])
     rows.append([b("‹ назад", f"s_data:{aid}")])
 
     try:
         await bot.edit_message_text(
-            "\n".join(lines),
-            chat_id=cid, message_id=mid,
+            "\n".join(lines), chat_id=cid, message_id=mid,
             reply_markup=kb(*rows), parse_mode='HTML'
         )
     except Exception as ex:
-        log.debug(f"render_stats: {ex}")
+        log.debug(f"render_stats slide: {ex}")
 
 
 @router.callback_query(F.data.startswith("stats:"))
@@ -2775,10 +2823,12 @@ async def cb_stats(cb: CallbackQuery):
     acc   = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
     if not acc: return
 
+    # Листание чатов — рендерим из кэша без нового анализа
     if page > 0:
         await _render_stats(cb.bot, cb.message.chat.id, cb.message.message_id, aid, page)
         return
 
+    # page=0 — каждый раз запускаем живой анализ
     asyncio.create_task(_live_analyze_stats(
         cb.bot, cb.message.chat.id, cb.message.message_id, aid
     ))
@@ -2789,69 +2839,15 @@ async def cb_stats_noop(cb: CallbackQuery):
     await cb.answer()
 
 
+# chat_detail больше не нужен — детали показывает слайдер _render_stats
 @router.callback_query(F.data.startswith("chat_detail:"))
 async def cb_chat_detail(cb: CallbackQuery):
     await cb.answer()
-    parts   = cb.data.split(":")
-    aid     = int(parts[1])
-    chat_id = int(parts[2])
-    acc     = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
+    parts = cb.data.split(":")
+    aid   = int(parts[1])
+    acc   = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
     if not acc: return
-
-    sc  = await db_get("SELECT * FROM stats_cache WHERE account_id=? AND chat_id=?", (aid, chat_id))
-    agg = await db_get(
-        "SELECT SUM(CASE WHEN is_outgoing=0 THEN 1 ELSE 0 END) as inc,"
-        "SUM(CASE WHEN is_outgoing=1 THEN 1 ELSE 0 END) as out,"
-        "SUM(is_voice) as voices, SUM(is_videonote) as vn, SUM(has_media) as media,"
-        "COUNT(*) as total FROM msg_cache WHERE account_id=? AND chat_id=?",
-        (aid, chat_id)
-    )
-
-    name     = (sc or {}).get('chat_name') or f"id:{chat_id}"
-    username = (sc or {}).get('username') or ''
-    unread   = (sc or {}).get('unread') or 0
-    last     = (sc or {}).get('last_date') or '—'
-    total_api= (sc or {}).get('total_msgs') or 0
-    inc_c    = (agg or {}).get('inc') or 0
-    out_c    = (agg or {}).get('out') or 0
-    voices   = max((sc or {}).get('voices') or 0, (agg or {}).get('voices') or 0)
-    vn       = max((sc or {}).get('videonotes') or 0, (agg or {}).get('vn') or 0)
-    media    = max((sc or {}).get('media_count') or 0, (agg or {}).get('media') or 0)
-    total    = max(total_api, (agg or {}).get('total') or 0)
-
-    ts      = max(total, 1)
-    pct_in  = int(inc_c / ts * 100)
-    pct_out = int(out_c / ts * 100)
-    bar_in  = _bar(inc_c, ts, 8)
-    bar_out = _bar(out_c, ts, 8)
-    med_pct = int((voices + vn + media) / ts * 100)
-
-    uname_ln = f"\n🔗 @{username}" if username else ""
-    unr_ln   = f"\n🔴 непрочитанных:  <b>{unread}</b>" if unread else ""
-
-    text = (
-        f"👤 <b>{name}</b>{uname_ln}{unr_ln}\n\n"
-        f"──────────────────\n"
-        f"💬 всего:  <b>{_fmt_num(total)}</b> сообщений\n\n"
-        f"📥 входящие:   <code>{bar_in}</code>\n"
-        f"   <b>{_fmt_num(inc_c)}</b>  ({pct_in}%)\n\n"
-        f"📤 исходящие:  <code>{bar_out}</code>\n"
-        f"   <b>{_fmt_num(out_c)}</b>  ({pct_out}%)\n\n"
-        f"──────────────────\n"
-        f"🎙 голосовых:   <b>{_fmt_num(voices)}</b>\n"
-        f"🎥 кружков:     <b>{_fmt_num(vn)}</b>\n"
-        f"📎 фото/видео:  <b>{_fmt_num(media)}</b>\n"
-        f"🖼 медиа итого: <b>{med_pct}%</b> от переписки\n\n"
-        f"──────────────────\n"
-        f"🕐 последнее:  {last}"
-    )
-    try:
-        await cb.message.edit_text(
-            text,
-            reply_markup=kb([b("‹ к списку", f"stats:{aid}:0")]),
-            parse_mode='HTML'
-        )
-    except Exception: pass
+    await _render_stats(cb.bot, cb.message.chat.id, cb.message.message_id, aid, 1)
 
 
 @router.callback_query(F.data.startswith("stats_top:"))
@@ -2866,14 +2862,6 @@ async def cb_stats_top(cb: CallbackQuery):
         "ORDER BY total_msgs DESC LIMIT 15",
         (aid,)
     )
-    if not top:
-        top = await db_all(
-            "SELECT chat_name, chat_id, COUNT(*) as total_msgs, "
-            "SUM(is_voice) as voices, SUM(is_videonote) as videonotes, "
-            "SUM(has_media) as media_count "
-            "FROM msg_cache WHERE account_id=? AND is_outgoing=0 AND chat_id != 0 "
-            "GROUP BY chat_id ORDER BY total_msgs DESC LIMIT 15", (aid,)
-        )
     if not top:
         await cb.message.edit_text(
             "🏆 <b>топ чатов</b>\n\n<i>данных нет — зайди в статистику для анализа</i>",
