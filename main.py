@@ -285,6 +285,11 @@ class DraftAdd(StatesGroup):
     content = State()   # накапливаем сообщения
     confirm = State()   # финальное подтверждение
 
+class SchedSend(StatesGroup):
+    chat    = State()   # ввод чата (@username / phone / id)
+    time    = State()   # ввод HH:MM
+    content = State()   # накапливаем сообщения
+
 
 # ══════════════════════════════════════
 # БАЗА ДАННЫХ
@@ -507,6 +512,25 @@ async def init_db():
                 peer_name  TEXT DEFAULT '',
                 peer_user  TEXT DEFAULT '',
                 UNIQUE(account_id, peer_id)
+            )
+            """)
+        except: pass
+
+        # Таблица отложенных/запланированных сообщений
+        try:
+            await db.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_sends(
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id   INTEGER NOT NULL,
+                chat_raw     TEXT DEFAULT '',
+                chat_name    TEXT DEFAULT '',
+                send_time    TEXT NOT NULL DEFAULT '',
+                days         TEXT DEFAULT 'daily',
+                content_json TEXT NOT NULL DEFAULT '',
+                active       INTEGER DEFAULT 1,
+                last_sent    TEXT DEFAULT '',
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
             )
             """)
         except: pass
@@ -2544,7 +2568,7 @@ async def _bg_sync_all(aid: int):
 # ══════════════════════════════════════
 # СТАТИСТИКА
 # ══════════════════════════════════════
-_STATS_PAGE = 6   # чатов на страницу
+_STATS_PAGE = 4   # профилей на страницу (2×2 сетка)
 
 def _fmt_num(n) -> str:
     n = int(n or 0)
@@ -2558,67 +2582,135 @@ def _bar(val: int, total: int, w: int = 8) -> str:
     filled = round(min(val/total, 1.0) * w)
     return "█" * filled + "░" * (w - filled)
 
-async def _render_stats(bot, cid: int, mid: int, aid: int, page: int) -> None:
-    """Рендерит статистику из кэша (мгновенно)."""
-    rows_db = await db_all(
-        "SELECT * FROM stats_cache WHERE account_id=? ORDER BY total_msgs DESC",
+async def _get_stats_rows(aid: int) -> list:
+    """Объединяет stats_cache и msg_cache, возвращает единый список чатов."""
+    sc_rows = await db_all(
+        "SELECT * FROM stats_cache WHERE account_id=? ORDER BY total_msgs DESC", (aid,)
+    )
+    agg_rows = await db_all(
+        "SELECT chat_id, chat_name, sender_name, COUNT(*) as total,"
+        " SUM(CASE WHEN is_outgoing=0 THEN 1 ELSE 0 END) as inc,"
+        " SUM(CASE WHEN is_outgoing=1 THEN 1 ELSE 0 END) as out,"
+        " SUM(is_voice) as voices, SUM(is_videonote) as vn, SUM(has_media) as media"
+        " FROM msg_cache WHERE account_id=? AND chat_id!=0 GROUP BY chat_id",
         (aid,)
     )
-    # Если кэш пуст — из msg_cache
-    if not rows_db:
-        agg = await db_all(
-            "SELECT chat_id, chat_name, "
-            "SUM(CASE WHEN is_outgoing=0 THEN 1 ELSE 0 END) as inc, "
-            "SUM(CASE WHEN is_outgoing=1 THEN 1 ELSE 0 END) as out, "
-            "SUM(is_voice) as voices, SUM(is_videonote) as vn, SUM(has_media) as media "
-            "FROM msg_cache WHERE account_id=? AND chat_id!=0 GROUP BY chat_id ORDER BY inc DESC",
-            (aid,)
-        )
-        rows_db = [{'chat_id': r['chat_id'], 'chat_name': r['chat_name'] or f"id:{r['chat_id']}",
-                    'username': '', 'total_msgs': r['inc'] or 0, 'out_msgs': r['out'] or 0,
-                    'voices': r['voices'] or 0, 'videonotes': r['vn'] or 0,
-                    'media_count': r['media'] or 0, 'unread': 0, 'last_date': ''} for r in agg]
+    agg = {r['chat_id']: r for r in agg_rows}
+    sc_by_id = {r['chat_id']: r for r in sc_rows}
 
+    result = []
+    seen = set()
+
+    for r in sc_rows:
+        cid = r['chat_id']
+        seen.add(cid)
+        ag = agg.get(cid, {})
+        result.append({
+            'chat_id':    cid,
+            'chat_name':  r.get('chat_name') or ag.get('chat_name') or ag.get('sender_name') or f"id:{cid}",
+            'username':   r.get('username') or '',
+            'total_msgs': max(r.get('total_msgs') or 0, ag.get('total') or 0),
+            'out_msgs':   max(r.get('out_msgs') or 0,   ag.get('out') or 0),
+            'inc_msgs':   ag.get('inc') or 0,
+            'voices':     max(r.get('voices') or 0,     ag.get('voices') or 0),
+            'videonotes': max(r.get('videonotes') or 0, ag.get('vn') or 0),
+            'media_count':max(r.get('media_count') or 0,ag.get('media') or 0),
+            'unread':     r.get('unread') or 0,
+            'last_date':  r.get('last_date') or '',
+        })
+
+    # Чаты только из msg_cache (ещё не в stats_cache)
+    for r in agg_rows:
+        cid = r['chat_id']
+        if cid in seen: continue
+        result.append({
+            'chat_id':    cid,
+            'chat_name':  r.get('chat_name') or r.get('sender_name') or f"id:{cid}",
+            'username':   '',
+            'total_msgs': r.get('total') or 0,
+            'out_msgs':   r.get('out') or 0,
+            'inc_msgs':   r.get('inc') or 0,
+            'voices':     r.get('voices') or 0,
+            'videonotes': r.get('vn') or 0,
+            'media_count':r.get('media') or 0,
+            'unread':     0,
+            'last_date':  '',
+        })
+
+    result.sort(key=lambda x: x['total_msgs'], reverse=True)
+    return result
+
+
+async def _render_stats(bot, cid: int, mid: int, aid: int, page: int,
+                        loading: bool = False) -> None:
+    """Рендерит статистику. loading=True → показывает индикатор обновления."""
+    rows_db = await _get_stats_rows(aid)
     total_chats = len(rows_db)
-    total_msgs  = sum(r['total_msgs'] or 0 for r in rows_db)
-    total_unr   = sum(r['unread'] or 0 for r in rows_db)
 
+    if total_chats == 0:
+        text = (
+            "📊 <b>статистика</b>\n\n"
+            "⏳ <i>данные загружаются...</i>\n"
+            "нажми «обновить» через несколько секунд"
+        )
+        try:
+            await bot.edit_message_text(
+                text, chat_id=cid, message_id=mid,
+                reply_markup=kb(
+                    [b("🔄 обновить", f"stats_refresh:{aid}")],
+                    [b("‹ назад", f"s_data:{aid}")]
+                ), parse_mode='HTML'
+            )
+        except: pass
+        return
+
+    total_unr = sum(r['unread'] or 0 for r in rows_db)
     pages = max(1, (total_chats + _STATS_PAGE - 1) // _STATS_PAGE)
     page  = max(0, min(page, pages - 1))
     chunk = rows_db[page * _STATS_PAGE : (page+1) * _STATS_PAGE]
 
     unr_txt = f"  ·  🔴 {total_unr} непрочит" if total_unr else ""
-    lines = [f"📊 <b>личные чаты</b>  ·  {total_chats} контактов{unr_txt}\n"]
+    upd_txt = "  ·  <i>обновление...</i>" if loading else ""
+    lines   = [f"📊 <b>личные чаты</b>  ·  {total_chats} контактов{unr_txt}{upd_txt}\n"]
 
     for r in chunk:
-        name = (r['chat_name'] or '?')[:20]
+        name = (r['chat_name'] or '?')[:22]
         cnt  = r['total_msgs'] or 0
         unr  = r['unread'] or 0
         unr_ic = f" 🔴{unr}" if unr else ""
         ext = []
-        if r.get('voices'):     ext.append(f"🎙{_fmt_num(r['voices'])}")
-        if r.get('videonotes'): ext.append(f"🎥{_fmt_num(r['videonotes'])}")
-        if r.get('media_count'):ext.append(f"📎{_fmt_num(r['media_count'])}")
+        if r.get('voices'):      ext.append(f"🎙{_fmt_num(r['voices'])}")
+        if r.get('videonotes'):  ext.append(f"🎥{_fmt_num(r['videonotes'])}")
+        if r.get('media_count'): ext.append(f"📎{_fmt_num(r['media_count'])}")
         ext_txt = "  " + " ".join(ext) if ext else ""
-        lines.append(f"👤 <b>{name}</b>{unr_ic}  · {_fmt_num(cnt)} сообщ{ext_txt}")
+        lines.append(f"👤 <b>{name}</b>{unr_ic}  ·  {_fmt_num(cnt)} сообщ{ext_txt}")
 
-    rows = [[b(f"{'👤'} {(r['chat_name'] or '?')[:18]}", f"chat_detail:{aid}:{r['chat_id']}")] for r in chunk]
+    # ── кнопки профилей 2×2 ──
+    btn_rows = []
+    for i in range(0, len(chunk), 2):
+        row = []
+        for r in chunk[i:i+2]:
+            nm = (r['chat_name'] or '?')[:16]
+            unr_ic = "🔴" if r.get('unread') else "👤"
+            row.append(b(f"{unr_ic} {nm}", f"chat_detail:{aid}:{r['chat_id']}"))
+        btn_rows.append(row)
 
-    nav_btns = []
+    # ── навигация ──
     if pages > 1:
-        if page > 0:       nav_btns.append(b("◀", f"stats:{aid}:{page-1}"))
-        nav_btns.append(   b(f"{page+1}/{pages}", "noop"))
-        if page < pages-1: nav_btns.append(b("▶", f"stats:{aid}:{page+1}"))
-        rows.append(nav_btns)
+        nav = []
+        if page > 0:        nav.append(b("◀", f"stats:{aid}:{page-1}"))
+        nav.append(b(f"{page+1} / {pages}", "stats_noop"))
+        if page < pages-1:  nav.append(b("▶", f"stats:{aid}:{page+1}"))
+        btn_rows.append(nav)
 
-    rows.append([b("🏆 топ чатов", f"stats_top:{aid}"), b("🔄 обновить", f"stats_refresh:{aid}")])
-    rows.append([b("‹ назад", f"s_data:{aid}")])
+    btn_rows.append([b("🏆 топ чатов", f"stats_top:{aid}"), b("🔄 обновить", f"stats_refresh:{aid}")])
+    btn_rows.append([b("‹ назад", f"s_data:{aid}")])
 
     try:
         await bot.edit_message_text(
             "\n".join(lines),
             chat_id=cid, message_id=mid,
-            reply_markup=kb(*rows), parse_mode='HTML'
+            reply_markup=kb(*btn_rows), parse_mode='HTML'
         )
     except Exception as e:
         log.debug(f"render_stats: {e}")
@@ -2632,21 +2724,33 @@ async def cb_stats(cb: CallbackQuery):
     page  = int(parts[2]) if len(parts) > 2 else 0
     acc   = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
     if not acc: return
-    # При первом открытии — запускаем фоновое обновление если кэш пуст
+
+    # Запускаем фоновое обновление если кэш пуст
     has_cache = await db_get("SELECT id FROM stats_cache WHERE account_id=? LIMIT 1", (aid,))
     if not has_cache:
         asyncio.create_task(cm.refresh_stats_cache(aid))
+
     await _render_stats(cb.bot, cb.message.chat.id, cb.message.message_id, aid, page)
 
 
 @router.callback_query(F.data.startswith("stats_refresh:"))
 async def cb_stats_refresh(cb: CallbackQuery):
+    await cb.answer()   # тихий ответ — без уведомления
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
-    await cb.answer("🔄 обновляем...")
-    asyncio.create_task(cm.refresh_stats_cache(aid))
-    await _render_stats(cb.bot, cb.message.chat.id, cb.message.message_id, aid, 0)
+    if not acc: return
+    cid = cb.message.chat.id
+    mid = cb.message.message_id
+
+    # Показываем «обновление...» прямо в сообщении (без тоста)
+    await _render_stats(cb.bot, cid, mid, aid, 0, loading=True)
+
+    # Ждём завершения обновления, потом перерисовываем
+    async def _refresh_and_update():
+        await cm.refresh_stats_cache(aid)
+        await _render_stats(cb.bot, cid, mid, aid, 0, loading=False)
+
+    asyncio.create_task(_refresh_and_update())
 
 
 @router.callback_query(F.data == "stats_noop")
@@ -2663,35 +2767,58 @@ async def cb_chat_detail(cb: CallbackQuery):
     acc     = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
     if not acc: return
 
+    # Берём данные из обоих источников и объединяем
     sc  = await db_get("SELECT * FROM stats_cache WHERE account_id=? AND chat_id=?", (aid, chat_id))
     agg = await db_get(
-        "SELECT SUM(CASE WHEN is_outgoing=0 THEN 1 ELSE 0 END) as inc,"
-        "SUM(CASE WHEN is_outgoing=1 THEN 1 ELSE 0 END) as out,"
-        "SUM(is_voice) as voices, SUM(is_videonote) as vn, SUM(has_media) as media,"
-        "COUNT(*) as total FROM msg_cache WHERE account_id=? AND chat_id=?",
+        "SELECT COUNT(*) as total,"
+        " SUM(CASE WHEN is_outgoing=0 THEN 1 ELSE 0 END) as inc,"
+        " SUM(CASE WHEN is_outgoing=1 THEN 1 ELSE 0 END) as out,"
+        " SUM(is_voice) as voices, SUM(is_videonote) as vn, SUM(has_media) as media,"
+        " MAX(chat_name) as chat_name, MAX(sender_name) as sender_name"
+        " FROM msg_cache WHERE account_id=? AND chat_id=?",
         (aid, chat_id)
     )
 
-    name     = (sc or {}).get('chat_name') or f"id:{chat_id}"
-    username = (sc or {}).get('username') or ''
-    unread   = (sc or {}).get('unread') or 0
-    last     = (sc or {}).get('last_date') or '—'
-    total_api= (sc or {}).get('total_msgs') or 0
-    inc_c    = (agg or {}).get('inc') or 0
-    out_c    = (agg or {}).get('out') or 0
-    voices   = max((sc or {}).get('voices') or 0, (agg or {}).get('voices') or 0)
-    vn       = max((sc or {}).get('videonotes') or 0, (agg or {}).get('vn') or 0)
-    media    = max((sc or {}).get('media_count') or 0, (agg or {}).get('media') or 0)
-    total    = max(total_api, (agg or {}).get('total') or 0)
+    sc   = sc   or {}
+    agg  = agg  or {}
+
+    name     = sc.get('chat_name') or agg.get('chat_name') or agg.get('sender_name') or f"id:{chat_id}"
+    username = sc.get('username') or ''
+    unread   = sc.get('unread') or 0
+    last     = sc.get('last_date') or '—'
+    total_api = sc.get('total_msgs') or 0
+    total_loc = agg.get('total') or 0
+    inc_c    = max(sc.get('out_msgs') and (total_api - sc.get('out_msgs',0)) or 0,
+                   agg.get('inc') or 0)
+    out_c    = max(sc.get('out_msgs') or 0, agg.get('out') or 0)
+    voices   = max(sc.get('voices') or 0,     agg.get('voices') or 0)
+    vn       = max(sc.get('videonotes') or 0,  agg.get('vn') or 0)
+    media    = max(sc.get('media_count') or 0, agg.get('media') or 0)
+    total    = max(total_api, total_loc)
+
+    if not name or name.startswith('id:'):
+        # Попробуем достать из Telethon живьём
+        c = cm.get(aid)
+        if c:
+            try:
+                ent = await c.get_entity(chat_id)
+                name = (getattr(ent,'first_name','') or '').strip()
+                if getattr(ent,'last_name',None): name += ' ' + ent.last_name.strip()
+                name = name.strip() or f"id:{chat_id}"
+                username = getattr(ent, 'username', '') or ''
+            except: pass
 
     uname_ln = f"@{username}\n" if username else ""
     unr_ln   = f"🔴 непрочитанных: <b>{unread}</b>\n" if unread else ""
-    ts       = max(total, 1)
+    ts       = max(total, inc_c + out_c, 1)
 
     text = (
-        f"👤 <b>{name}</b>\n{uname_ln}{unr_ln}\n"
-        f"📥 входящих:  <code>{_bar(inc_c, ts, 6)}</code> <b>{_fmt_num(inc_c)}</b>\n"
-        f"📤 исходящих: <code>{_bar(out_c, ts, 6)}</code> <b>{_fmt_num(out_c)}</b>\n\n"
+        f"👤 <b>{name}</b>\n"
+        f"{uname_ln}"
+        f"{unr_ln}\n"
+        f"📥 входящих:   <code>{_bar(inc_c, ts, 7)}</code> <b>{_fmt_num(inc_c)}</b>\n"
+        f"📤 исходящих:  <code>{_bar(out_c, ts, 7)}</code> <b>{_fmt_num(out_c)}</b>\n"
+        f"💬 всего:       <b>{_fmt_num(total)}</b>\n\n"
         f"🎙 голосовых:  <b>{_fmt_num(voices)}</b>\n"
         f"🎥 кружков:    <b>{_fmt_num(vn)}</b>\n"
         f"📎 с медиа:    <b>{_fmt_num(media)}</b>\n\n"
@@ -2703,7 +2830,8 @@ async def cb_chat_detail(cb: CallbackQuery):
             reply_markup=kb([b("‹ к списку", f"stats:{aid}:0")]),
             parse_mode='HTML'
         )
-    except: pass
+    except Exception as e:
+        log.debug(f"chat_detail: {e}")
 @router.callback_query(F.data.startswith("stats_top:"))
 async def cb_stats_top(cb: CallbackQuery):
     await cb.answer()
@@ -3292,12 +3420,15 @@ async def cb_chk(cb: CallbackQuery):
 # ══════════════════════════════════════
 async def _ar_menu(cb, aid, acc):
     rules = await db_all("SELECT id FROM autoreply_rules WHERE account_id=?", (aid,))
+    scheds = await db_all("SELECT id FROM scheduled_sends WHERE account_id=? AND active=1", (aid,))
     st    = "✅" if acc.get('autoreply_on') else "☐"
     await edit(cb,
-        f"🤖 <b>автоответчик</b>\n\nправил: <b>{len(rules)}</b>",
+        f"🤖 <b>автоответчик</b>\n\n"
+        f"правил: <b>{len(rules)}</b>  ·  запланировано: <b>{len(scheds)}</b>",
         kb(
             [b(f"↕️ вкл / выкл {st}", f"ar:{aid}:toggle")],
             [b("📋 правила", f"ar:{aid}:list:0"), b("➕ добавить", f"ar:{aid}:add")],
+            [b("📅 отложенные сообщения", f"sched:{aid}:list:0")],
             [b("‹ назад", f"s_auto_replies:{aid}")]
         )
     )
@@ -3400,10 +3531,11 @@ async def ar_trigger(msg: Message, state: FSMContext):
     trig_db  = '|'.join(triggers)    # для хранения в БД
     await state.update_data(ar_trig=trig_db, ar_trig_display=trig_str, ar_items=[], ar_album_buf={})
     await state.set_state(ARState.content)
+    trig_bq = _trig_blockquote(trig_db)
     try:
         await msg.bot.edit_message_text(
             f"➕ <b>новое правило</b>  ·  шаг 2/3\n\n"
-            f"триггер(ы): <code>{trig_str[:200]}</code>\n\n"
+            f"триггер(ы):\n{trig_bq}\n"
             f"отправь одно или несколько сообщений — они все будут отправляться по триггеру\n"
             f"когда закончишь — нажми <b>готово</b>",
             chat_id=data['chat_id'], message_id=data['msg_id'],
@@ -3422,6 +3554,7 @@ async def ar_content_input(msg: Message, state: FSMContext):
     data  = await state.get_data()
     aid   = data['aid']; mid = data['msg_id']; cid = data['chat_id']
     trig_str = data.get('ar_trig_display', '')
+    trig_bq  = _trig_blockquote(data.get('ar_trig', trig_str))
     items = data.get('ar_items', [])
     album_buf = data.get('ar_album_buf', {})
 
@@ -3459,7 +3592,7 @@ async def ar_content_input(msg: Message, state: FSMContext):
             try:
                 await msg.bot.edit_message_text(
                     f"➕ <b>новое правило</b>  ·  шаг 2/3\n\n"
-                    f"триггер(ы): <code>{trig_str[:200]}</code>\n"
+                    f"триггер(ы):\n{trig_bq}\n"
                     f"добавлено: <b>{len(itms2)}</b>  ·  последнее: 🗂 альбом ({len(group_items)} шт)\n\n"
                     f"<blockquote expandable>{summ[:400]}</blockquote>\n\n"
                     f"можешь отправить ещё или нажать <b>готово</b>",
@@ -3494,7 +3627,7 @@ async def ar_content_input(msg: Message, state: FSMContext):
     try:
         await msg.bot.edit_message_text(
             f"➕ <b>новое правило</b>  ·  шаг 2/3\n\n"
-            f"триггер(ы): <code>{trig_str[:200]}</code>\n"
+            f"триггер(ы):\n{trig_bq}\n"
             f"добавлено: <b>{count}</b>  ·  последнее: {ic} {lbl}\n\n"
             f"<blockquote expandable>{summary[:400]}</blockquote>\n\n"
             f"можешь отправить ещё или нажать <b>готово</b>",
@@ -3520,12 +3653,13 @@ async def ar_done(cb: CallbackQuery, state: FSMContext):
     await state.set_state(ARState.match)
     cid = data['chat_id']; mid = data['msg_id']
     trig_str = data.get('ar_trig_display', '')
+    trig_bq  = _trig_blockquote(data.get('ar_trig', trig_str))
     import json as _j
     _, summary, count = _draft_summary(_j.dumps(items))
     try:
         await cb.bot.edit_message_text(
             f"➕ <b>новое правило</b>  ·  шаг 3/3\n\n"
-            f"триггер(ы): <code>{trig_str[:200]}</code>\n"
+            f"триггер(ы):\n{trig_bq}\n"
             f"сообщений: <b>{count}</b>\n\n"
             f"<blockquote expandable>{summary[:300]}</blockquote>\n\n"
             f"тип совпадения триггера:",
@@ -3556,16 +3690,497 @@ async def ar_match(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     mt_labels = {'contains': 'содержит', 'exact': 'точное', 'startswith': 'начинается с'}
     trig_display = data.get('ar_trig_display', trig_db)
+    trig_bq = _trig_blockquote(trig_db)
     _, summary, count = _draft_summary(content_json) if content_json else ('', '?', 0)
     try:
         await cb.message.edit_text(
             f"✅ <b>правило добавлено</b>\n\n"
-            f"триггер(ы): <code>{trig_display[:200]}</code>  ·  <b>{mt_labels.get(mt, mt)}</b>\n"
-            f"сообщений: <b>{count}</b>",
+            f"триггер(ы):\n{trig_bq}\n"
+            f"совпадение: <b>{mt_labels.get(mt, mt)}</b>  ·  сообщений: <b>{count}</b>",
             reply_markup=kb([b("📋 правила", f"ar:{aid}:list:0")], [b("‹ назад", f"ar:{aid}:menu")]),
             parse_mode='HTML'
         )
     except: pass
+
+
+
+
+# ══════════════════════════════════════
+# 📅 ЗАПЛАНИРОВАННЫЕ СООБЩЕНИЯ
+# ══════════════════════════════════════
+
+def _days_label(days: str) -> str:
+    if days == 'daily':    return '📅 каждый день'
+    if days == 'workdays': return '💼 пн–пт'
+    if days == 'weekends': return '🏖 сб–вс'
+    try:
+        _nm = ['вс','пн','вт','ср','чт','пт','сб']
+        nums = [int(d) for d in days.split(',') if d.strip().isdigit()]
+        return '📆 ' + ', '.join(_nm[n] for n in sorted(nums) if 0 <= n <= 6)
+    except: return days or 'каждый день'
+
+
+def _days_active(days: str) -> set:
+    if days == 'daily':    return set(range(7))
+    if days == 'workdays': return {0,1,2,3,4}
+    if days == 'weekends': return {5,6}
+    try: return {int(x) for x in days.split(',') if x.strip().isdigit()}
+    except: return set(range(7))
+
+
+async def _sched_list_render(bot, cid: int, mid: int, aid: int, page: int):
+    """Рендерит список запланированных отправок."""
+    import json as _j
+    scheds = await db_all(
+        "SELECT * FROM scheduled_sends WHERE account_id=? ORDER BY send_time ASC, id DESC", (aid,)
+    )
+    total = len(scheds)
+
+    async def _edit(text, markup):
+        try:
+            await bot.edit_message_text(text, chat_id=cid, message_id=mid,
+                                        reply_markup=markup, parse_mode='HTML')
+        except: pass
+
+    if not scheds:
+        await _edit(
+            "📅 <b>запланированные сообщения</b>\n\n"
+            "пока пусто — добавь расписание, и бот сам будет отправлять сообщения в нужное время",
+            kb([b("➕ добавить", f"sched:{aid}:add"), b("‹ назад", f"ar:{aid}:menu")])
+        )
+        return
+
+    pages = max(1, (total + 3) // 4)
+    page  = max(0, min(page, pages - 1))
+    chunk = scheds[page*4 : (page+1)*4]
+
+    lines = [f"📅 <b>запланированные сообщения</b>  ·  {total} шт\n"]
+    btn_rows = []
+    for s in chunk:
+        cnt = 0
+        try: cnt = len(_j.loads(s['content_json']))
+        except: pass
+        st   = "✅" if s.get('active', 1) else "❌"
+        dsp  = _days_label(s.get('days', 'daily'))
+        chat = (s.get('chat_name') or s.get('chat_raw') or '?')[:20]
+        last = s.get('last_sent') or 'никогда'
+        lines.append(f"{st} <b>{s['send_time']}</b>  {dsp}\n    📤 {chat}  ·  {cnt} сообщ  ·  ↩ {last}")
+        btn_rows.append([b(f"{st} {s['send_time']} → {chat[:14]}", f"sched:{aid}:view:{s['id']}")])
+
+    if pages > 1:
+        nav = []
+        if page > 0:        nav.append(b("◀", f"sched:{aid}:list:{page-1}"))
+        nav.append(b(f"{page+1}/{pages}", f"sched:{aid}:noop"))
+        if page < pages-1:  nav.append(b("▶", f"sched:{aid}:list:{page+1}"))
+        btn_rows.append(nav)
+
+    btn_rows.append([b("➕ добавить", f"sched:{aid}:add"), b("‹ назад", f"ar:{aid}:menu")])
+    await _edit("\n".join(lines), kb(*btn_rows))
+
+
+async def _sched_send_now(aid: int, s: dict) -> bool:
+    import json as _j
+    c = cm.get(aid)
+    if not c: return False
+    try:
+        entity = await c.get_entity(s['chat_raw'])
+        items  = _j.loads(s['content_json'])
+        if not isinstance(items, list): items = [items]
+        for i, item in enumerate(items):
+            await cm._send_content(c, entity, item)
+            if i < len(items) - 1: await asyncio.sleep(0.4)
+        today = datetime.now().strftime('%Y-%m-%d')
+        await db_run("UPDATE scheduled_sends SET last_sent=? WHERE id=?", (today, s['id']))
+        return True
+    except Exception as e:
+        log.warning(f"sched_send {s['id']}: {e}"); return False
+
+
+@router.callback_query(F.data.startswith("sched:"))
+async def cb_sched(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    parts  = cb.data.split(":")
+    aid    = int(parts[1])
+    action = parts[2] if len(parts) > 2 else "list"
+    extra  = parts[3] if len(parts) > 3 else "0"
+    acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
+    if not acc: return
+    cid = cb.message.chat.id; mid = cb.message.message_id
+
+    if action == "noop":
+        return
+
+    elif action == "list":
+        await _sched_list_render(cb.bot, cid, mid, aid, int(extra))
+
+    elif action == "add":
+        await state.set_state(SchedSend.chat)
+        await state.update_data(aid=aid, msg_id=mid, chat_id=cid,
+                                ss_days='daily', ss_time='',
+                                ss_items=[], ss_album_buf={}, ss_days_custom=set())
+        await edit(cb,
+            "📅 <b>новое расписание</b>  ·  шаг 1/3\n\n"
+            "укажи чат куда отправлять:\n"
+            "<i>@username, числовой id или номер телефона</i>",
+            kb([b("отмена", f"sched:{aid}:list:0")])
+        )
+
+    elif action == "view":
+        sid = int(extra)
+        s   = await db_get("SELECT * FROM scheduled_sends WHERE id=? AND account_id=?", (sid, aid))
+        if not s: return
+        import json as _j
+        cnt = 0
+        try: cnt = len(_j.loads(s['content_json']))
+        except: pass
+        dsp  = _days_label(s.get('days', 'daily'))
+        last = s.get('last_sent', '') or 'никогда'
+        st   = "✅ активно" if s.get('active', 1) else "❌ выключено"
+        chat = s.get('chat_name') or s.get('chat_raw') or '?'
+        await edit(cb,
+            f"📅 <b>расписание #{sid}</b>\n\n"
+            f"📤 чат: <code>{chat}</code>\n"
+            f"🕐 время: <b>{s['send_time']}</b>\n"
+            f"📆 дни: {dsp}\n"
+            f"💬 сообщений: <b>{cnt}</b>\n"
+            f"📌 статус: {st}\n"
+            f"↩ последняя: {last}",
+            kb(
+                [b("✅/❌ вкл/выкл", f"sched:{aid}:tog:{sid}"),
+                 b("🗑 удалить",      f"sched:{aid}:del:{sid}")],
+                [b("▶️ отправить сейчас", f"sched:{aid}:now:{sid}")],
+                [b("‹ к списку", f"sched:{aid}:list:0")]
+            )
+        )
+
+    elif action == "tog":
+        sid = int(extra)
+        s   = await db_get("SELECT active FROM scheduled_sends WHERE id=? AND account_id=?", (sid, aid))
+        if not s: return
+        await db_run("UPDATE scheduled_sends SET active=? WHERE id=?",
+                     (0 if s.get('active',1) else 1, sid))
+        cb.data = f"sched:{aid}:view:{sid}"
+        await cb_sched(cb, state)
+
+    elif action == "del":
+        sid = int(extra)
+        await db_run("DELETE FROM scheduled_sends WHERE id=? AND account_id=?", (sid, aid))
+        await _sched_list_render(cb.bot, cid, mid, aid, 0)
+
+    elif action == "now":
+        sid = int(extra)
+        s   = await db_get("SELECT * FROM scheduled_sends WHERE id=? AND account_id=?", (sid, aid))
+        if not s: return
+        stop = asyncio.Event()
+        asyncio.create_task(animate_loading(cb.bot, cid, mid, "📤 <b>отправляю...</b>", stop))
+        ok   = await _sched_send_now(aid, s)
+        stop.set()
+        try:
+            await cb.bot.edit_message_text(
+                ("✅ отправлено!" if ok else "❌ ошибка отправки"),
+                chat_id=cid, message_id=mid,
+                reply_markup=kb([b("‹ назад", f"sched:{aid}:view:{sid}")]),
+                parse_mode='HTML'
+            )
+        except: pass
+
+
+# ── FSM шаг 1: ввод чата ────────────────────────────────────────────
+def _ss_days_kb(aid: int, days: str, time_str: str) -> 'InlineKeyboardMarkup':
+    opts = [('daily','📅 каждый день'),('workdays','💼 пн–пт'),('weekends','🏖 сб–вс')]
+    rows = [[b(f"{"✅ " if days==k else ""}{v}", f"ss_days:{aid}:{k}")] for k,v in opts]
+    mc = '✅ ' if days not in ('daily','workdays','weekends') else ''
+    rows.append([b(f"{mc}✏️ свои дни", f"ss_days:{aid}:custom")])
+    if time_str:
+        rows.append([b("➡️ далее — добавить сообщения", f"ss_next:{aid}")])
+    rows.append([b("отмена", f"sched:{aid}:list:0")])
+    return kb(*rows)
+
+
+def _ss_custom_days_kb(aid: int, sel: set, time_str: str) -> 'InlineKeyboardMarkup':
+    _nm = ['пн','вт','ср','чт','пт','сб','вс']
+    row = [b(f"{"✅" if i in sel else "☐"} {_nm[i]}", f"ss_day:{aid}:{i}") for i in range(7)]
+    rows = [row]
+    if sel and time_str:
+        rows.append([b("➡️ далее — добавить сообщения", f"ss_next:{aid}")])
+    rows.append([b("‹ назад", f"ss_days:{aid}:daily"), b("отмена", f"sched:{aid}:list:0")])
+    return kb(*rows)
+
+
+@router.message(SchedSend.chat)
+async def ss_chat_input(msg: Message, state: FSMContext):
+    await delete_user_msg(msg)
+    data = await state.get_data()
+    aid  = data['aid']; mid = data['msg_id']; cid = data['chat_id']
+    raw  = (msg.text or '').strip()
+    if not raw: return
+    chat_name = raw
+    c = cm.get(aid)
+    if c:
+        try:
+            ent = await c.get_entity(raw.lstrip('@'))
+            chat_name = ((getattr(ent,'title',None) or getattr(ent,'first_name','') or raw) + ' ' +
+                         (getattr(ent,'last_name','') or '')).strip() or raw
+        except: pass
+    await state.update_data(ss_chat_raw=raw, ss_chat_name=chat_name)
+    await state.set_state(SchedSend.time)
+    try:
+        await msg.bot.edit_message_text(
+            f"📅 <b>новое расписание</b>  ·  шаг 2/3\n\n"
+            f"чат: <code>{chat_name}</code>\n\n"
+            f"введи время в формате <code>ЧЧ:ММ</code> (например <code>09:30</code>)\n"
+            f"затем выбери дни и нажми <b>далее</b>:",
+            chat_id=cid, message_id=mid,
+            reply_markup=_ss_days_kb(aid, data.get('ss_days','daily'), ''),
+            parse_mode='HTML'
+        )
+    except: pass
+
+
+@router.message(SchedSend.time)
+async def ss_time_input(msg: Message, state: FSMContext):
+    await delete_user_msg(msg)
+    data = await state.get_data()
+    aid  = data['aid']; mid = data['msg_id']; cid = data['chat_id']
+    raw  = (msg.text or '').strip()
+    import re as _re
+    m = _re.match(r'^(\d{1,2}):(\d{2})$', raw)
+    if not m or not (0 <= int(m.group(1)) <= 23 and 0 <= int(m.group(2)) <= 59):
+        try:
+            await msg.bot.edit_message_text(
+                f"📅 <b>новое расписание</b>  ·  шаг 2/3\n\n"
+                f"чат: <code>{data.get('ss_chat_name','?')}</code>\n\n"
+                f"❌ неверный формат — нужно <code>ЧЧ:ММ</code>, например <code>09:30</code>",
+                chat_id=cid, message_id=mid,
+                reply_markup=_ss_days_kb(aid, data.get('ss_days','daily'), data.get('ss_time','')),
+                parse_mode='HTML'
+            )
+        except: pass
+        return
+    time_str = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    await state.update_data(ss_time=time_str)
+    try:
+        await msg.bot.edit_message_text(
+            f"📅 <b>новое расписание</b>  ·  шаг 2/3\n\n"
+            f"чат: <code>{data.get('ss_chat_name','?')}</code>\n"
+            f"⏰ время: <b>{time_str}</b>\n\n"
+            f"выбери дни и нажми <b>далее</b>:",
+            chat_id=cid, message_id=mid,
+            reply_markup=_ss_days_kb(aid, data.get('ss_days','daily'), time_str),
+            parse_mode='HTML'
+        )
+    except: pass
+
+
+@router.callback_query(F.data.startswith("ss_days:"))
+async def cb_ss_days(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    parts  = cb.data.split(":")
+    aid    = int(parts[1]); choice = parts[2]
+    data   = await state.get_data()
+    if choice == 'custom':
+        cur = data.get('ss_days_custom', set())
+        if isinstance(cur, str):
+            try: cur = {int(x) for x in cur.split(',') if x.strip()}
+            except: cur = set()
+        await state.update_data(ss_days='custom', ss_days_custom=cur)
+        try: await cb.message.edit_reply_markup(
+            reply_markup=_ss_custom_days_kb(aid, cur, data.get('ss_time','')))
+        except: pass
+    else:
+        await state.update_data(ss_days=choice, ss_days_custom=set())
+        try: await cb.message.edit_reply_markup(
+            reply_markup=_ss_days_kb(aid, choice, data.get('ss_time','')))
+        except: pass
+
+
+@router.callback_query(F.data.startswith("ss_day:"))
+async def cb_ss_day(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    parts = cb.data.split(":"); aid = int(parts[1]); day = int(parts[2])
+    data  = await state.get_data()
+    cur   = data.get('ss_days_custom', set())
+    if isinstance(cur, str):
+        try: cur = {int(x) for x in cur.split(',') if x.strip()}
+        except: cur = set()
+    if day in cur: cur.discard(day)
+    else:          cur.add(day)
+    await state.update_data(ss_days_custom=cur)
+    try: await cb.message.edit_reply_markup(
+        reply_markup=_ss_custom_days_kb(aid, cur, data.get('ss_time','')))
+    except: pass
+
+
+@router.callback_query(F.data.startswith("ss_next:"))
+async def cb_ss_next(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    aid  = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    time_str = data.get('ss_time', '')
+    if not time_str:
+        await cb.answer("⚠️ сначала введи время ЧЧ:ММ", show_alert=True); return
+    days = data.get('ss_days', 'daily')
+    if days == 'custom':
+        cur = data.get('ss_days_custom', set())
+        if isinstance(cur, str):
+            try: cur = {int(x) for x in cur.split(',') if x.strip()}
+            except: cur = set()
+        if not cur:
+            await cb.answer("⚠️ выбери хотя бы один день", show_alert=True); return
+        days = ','.join(str(x) for x in sorted(cur))
+        await state.update_data(ss_days=days)
+    dsp = _days_label(days)
+    chat_name = data.get('ss_chat_name', data.get('ss_chat_raw', '?'))
+    await state.set_state(SchedSend.content)
+    await state.update_data(ss_items=[], ss_album_buf={})
+    try:
+        await cb.bot.edit_message_text(
+            f"📅 <b>новое расписание</b>  ·  шаг 3/3\n\n"
+            f"📤 чат: <code>{chat_name}</code>\n"
+            f"🕐 {time_str}  ·  {dsp}\n\n"
+            f"отправь сообщения которые нужно слать по расписанию\n"
+            f"(текст, фото, видео, голос, стикеры, альбомы — всё поддерживается)\n\n"
+            f"когда закончишь — нажми <b>готово</b>",
+            chat_id=data['chat_id'], message_id=data['msg_id'],
+            reply_markup=kb([b("✅ готово", f"ss_done:{aid}"),
+                             b("отмена",   f"sched:{aid}:list:0")]),
+            parse_mode='HTML'
+        )
+    except: pass
+
+
+@router.message(SchedSend.content)
+async def ss_content_input(msg: Message, state: FSMContext):
+    await delete_user_msg(msg)
+    data  = await state.get_data()
+    aid   = data['aid']; mid = data['msg_id']; cid = data['chat_id']
+    items = data.get('ss_items', [])
+    album_buf = data.get('ss_album_buf', {})
+    time_str = data.get('ss_time', ''); days = data.get('ss_days', 'daily')
+    dsp = _days_label(days); chat_nm = data.get('ss_chat_name', '?')
+
+    group_id = msg.media_group_id
+    if group_id:
+        grp_key = str(group_id)
+        item = _msg_to_content(msg)
+        if not item: return
+        if grp_key not in album_buf: album_buf[grp_key] = []
+        album_buf[grp_key].append(item)
+        await state.update_data(ss_album_buf=album_buf)
+        pending = data.get('ss_album_tasks', {})
+        if grp_key in pending:
+            try: pending[grp_key].cancel()
+            except: pass
+
+        async def _flush(gk=grp_key):
+            await asyncio.sleep(1.0)
+            d2  = await state.get_data()
+            buf2= d2.get('ss_album_buf', {})
+            gi  = buf2.pop(gk, [])
+            if not gi: return
+            it2 = d2.get('ss_items', [])
+            cap = next((i.get('caption','') for i in gi if i.get('caption')), '')
+            it2.append({'type':'album','items':gi,'caption':cap})
+            await state.update_data(ss_items=it2, ss_album_buf=buf2)
+            import json as _j2
+            _, summ, _ = _draft_summary(_j2.dumps(it2))
+            try:
+                await msg.bot.edit_message_text(
+                    f"📅 <b>новое расписание</b>  ·  шаг 3/3\n\n"
+                    f"📤 {chat_nm}  🕐 {time_str}  {dsp}\n"
+                    f"добавлено: <b>{len(it2)}</b>  ·  🗂 альбом ({len(gi)} шт)\n\n"
+                    f"<blockquote expandable>{summ[:400]}</blockquote>\n"
+                    f"можешь отправить ещё или нажать <b>готово</b>",
+                    chat_id=cid, message_id=mid,
+                    reply_markup=kb([b(f"✅ готово ({len(it2)})", f"ss_done:{aid}"),
+                                     b("отмена", f"sched:{aid}:list:0")]),
+                    parse_mode='HTML'
+                )
+            except: pass
+
+        task = asyncio.create_task(_flush())
+        pending[grp_key] = task
+        await state.update_data(ss_album_tasks=pending)
+        return
+
+    item = _msg_to_content(msg)
+    if not item: return
+    items.append(item)
+    await state.update_data(ss_items=items)
+    import json as _j
+    _, summary, _ = _draft_summary(_j.dumps(items))
+    ic  = _DRAFT_ICONS.get(item.get('type',''), '📄')
+    lbl = _DRAFT_LABELS.get(item.get('type','')) or item.get('type','')
+    try:
+        await msg.bot.edit_message_text(
+            f"📅 <b>новое расписание</b>  ·  шаг 3/3\n\n"
+            f"📤 {chat_nm}  🕐 {time_str}  {dsp}\n"
+            f"добавлено: <b>{len(items)}</b>  ·  {ic} {lbl}\n\n"
+            f"<blockquote expandable>{summary[:400]}</blockquote>\n"
+            f"можешь отправить ещё или нажать <b>готово</b>",
+            chat_id=cid, message_id=mid,
+            reply_markup=kb([b(f"✅ готово ({len(items)})", f"ss_done:{aid}"),
+                             b("отмена", f"sched:{aid}:list:0")]),
+            parse_mode='HTML'
+        )
+    except: pass
+
+
+@router.callback_query(F.data.startswith("ss_done:"))
+async def cb_ss_done(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    aid  = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    items    = data.get('ss_items', [])
+    time_str = data.get('ss_time', '')
+    days     = data.get('ss_days', 'daily')
+    chat_raw = data.get('ss_chat_raw', '')
+    chat_nm  = data.get('ss_chat_name', chat_raw)
+    if not items:
+        await cb.answer("⚠️ добавь хотя бы одно сообщение", show_alert=True); return
+    if not time_str:
+        await cb.answer("⚠️ не указано время", show_alert=True); return
+    import json as _j
+    content_json = _j.dumps(items, ensure_ascii=False)
+    await db_run(
+        "INSERT INTO scheduled_sends(account_id,chat_raw,chat_name,send_time,days,content_json,active)"
+        " VALUES(?,?,?,?,?,?,1)",
+        (aid, chat_raw, chat_nm, time_str, days, content_json)
+    )
+    await state.clear()
+    _, _, count = _draft_summary(content_json)
+    try:
+        await cb.message.edit_text(
+            f"✅ <b>расписание добавлено</b>\n\n"
+            f"📤 чат: <code>{chat_nm}</code>\n"
+            f"🕐 время: <b>{time_str}</b>  ·  {_days_label(days)}\n"
+            f"💬 сообщений: <b>{count}</b>\n\n"
+            f"бот будет отправлять их автоматически ⚡",
+            reply_markup=kb([b("📅 к расписаниям", f"sched:{aid}:list:0"),
+                             b("‹ меню", f"ar:{aid}:menu")]),
+            parse_mode='HTML'
+        )
+    except: pass
+
+
+async def bg_scheduler():
+    """Каждую минуту проверяет и запускает запланированные отправки."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            now      = datetime.now()
+            time_str = now.strftime('%H:%M')
+            today_wd = now.weekday()   # 0=пн, 6=вс
+            today_dt = now.strftime('%Y-%m-%d')
+            rows = await db_all("SELECT * FROM scheduled_sends WHERE active=1 AND send_time=?", (time_str,))
+            for s in rows:
+                if s.get('last_sent', '') == today_dt: continue
+                if today_wd not in _days_active(s.get('days', 'daily')): continue
+                asyncio.create_task(_sched_send_now(s['account_id'], s))
+        except Exception as e:
+            log.warning(f"bg_scheduler: {e}")
+        await asyncio.sleep(60)
+
 
 # ══════════════════════════════════════
 # АВТОУДАЛЕНИЕ
@@ -4328,6 +4943,29 @@ def _draft_summary(content_json_str: str) -> tuple:
     return icon, '\n'.join(parts), count
 
 
+def _trig_blockquote(trig_db: str) -> str:
+    """Форматирует триггеры как блок-цитата (collapsible), каждый на отдельной строке в моно."""
+    trigs = [t.strip() for t in trig_db.split('|') if t.strip()]
+    if not trigs:
+        return '<blockquote>—</blockquote>'
+    lines = '\n'.join(f'<code>{t}</code>' for t in trigs)
+    if len(trigs) == 1:
+        return f'<blockquote>{lines}</blockquote>'
+    return f'<blockquote expandable>{lines}</blockquote>'
+
+
+_DAYS_LABELS = {
+    'daily':    '📅 каждый день',
+    'workdays': '💼 пн–пт',
+    'weekends': '🏖 сб–вс',
+    'custom':   '✏️ свои дни',
+}
+_DAYS_SHORT = {
+    '0': 'вс', '1': 'пн', '2': 'вт', '3': 'ср',
+    '4': 'чт', '5': 'пт', '6': 'сб',
+}
+
+
 def _msg_to_content(msg: Message) -> dict:
     """Конвертирует aiogram Message в content-dict для хранения в БД."""
     ents = _serialize_entities(msg)
@@ -4763,6 +5401,7 @@ async def main():
     asyncio.create_task(bg_autodel())
     asyncio.create_task(bg_online_watchdog())
     asyncio.create_task(bg_online_tracker())
+    asyncio.create_task(bg_scheduler())
 
     log.info("🤖 Bot v3.0 started!")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
