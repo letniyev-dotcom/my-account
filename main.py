@@ -57,6 +57,9 @@ from telethon.tl.types import (
     InputPrivacyKeyStatusTimestamp,
     InputPrivacyKeyProfilePhoto,
     InputPrivacyKeyAbout,
+    InputMessagesFilterVoice,
+    InputMessagesFilterRoundVideo,
+    InputMessagesFilterPhotoVideo,
 )
 
 # ══════════════════════════════════════
@@ -274,7 +277,7 @@ class OTAdd(StatesGroup):
     username = State()
 
 class BroadcastState(StatesGroup):
-    message   = State()
+    content   = State()   # накапливаем сообщения (как черновик)
     usernames = State()
 
 class ARSchedule(StatesGroup):
@@ -1493,11 +1496,10 @@ class CM:
             await c.send_file(entity, bio, caption=caption, parse_mode='html', **extra)
 
     async def broadcast(self, aid: int, user_id: int, usernames: List[str],
-                        content: dict, progress_cb=None) -> dict:
+                        items: list, progress_cb=None) -> dict:
         """
-        Рассылка любого контента (текст, фото, видео, ГС, стикер, документ…).
-        content = {'type': 'text'|'photo'|'video'|'voice'|'sticker'|…,
-                   'text'/'caption': str, 'file_id': str, 'filename': str}
+        Рассылка нескольких сообщений любого типа каждому получателю.
+        items — список content-dict (как в черновиках).
         """
         c = self.get(aid)
         if not c:  return {'sent': 0, 'failed': 0, 'errors': ['клиент не активен']}
@@ -1509,7 +1511,11 @@ class CM:
         errors = []
         self._broadcasts[aid] = {'running': True}
 
-        preview = content.get('text') or content.get('caption') or f"[{content.get('type','?')}]"
+        # Поддержка старого формата (один dict вместо списка)
+        if isinstance(items, dict):
+            items = [items]
+
+        preview = items[0].get('text') or items[0].get('caption') or f"[{items[0].get('type','?')}]" if items else "?"
         log_id = await db_run(
             "INSERT INTO broadcast_log(account_id,message,total) VALUES(?,?,?)",
             (aid, preview[:500], total)
@@ -1523,10 +1529,14 @@ class CM:
             if not uname: continue
             try:
                 entity = await c.get_entity(uname)
-                act = 'typing' if content.get('type') == 'text' else 'document'
+                first_item = items[0] if items else {}
+                act = 'typing' if first_item.get('type') == 'text' else 'document'
                 async with c.action(entity, act):
                     await asyncio.sleep(random.uniform(1.5, 3.0))
-                await self._send_content(c, entity, content)
+                for item in items:
+                    await self._send_content(c, entity, item)
+                    if len(items) > 1:
+                        await asyncio.sleep(0.5)
                 sent += 1
                 await db_run("UPDATE broadcast_log SET sent=? WHERE id=?", (sent, log_id))
                 if progress_cb:
@@ -1544,7 +1554,10 @@ class CM:
                 await asyncio.sleep(wait)
                 try:
                     entity = await c.get_entity(uname)
-                    await self._send_content(c, entity, content)
+                    for item in items:
+                        await self._send_content(c, entity, item)
+                        if len(items) > 1:
+                            await asyncio.sleep(0.5)
                     sent += 1
                 except Exception as e2:
                     failed += 1; errors.append(f"@{uname}: {e2}")
@@ -1633,8 +1646,26 @@ class CM:
                     total_msgs = getattr(res, 'total', 0) or 0
                 except Exception:
                     total_msgs = agg.get(d.id, {}).get('total', 0) or 0
-                ag = agg.get(d.id, {})
+                ag       = agg.get(d.id, {})
                 last_str = d.date.strftime('%d.%m.%Y %H:%M') if d.date else ''
+
+                # Подсчёт ГС, кружков и медиа через Telegram API (точные данные)
+                voices_cnt = ag.get('voices', 0) or 0
+                vn_cnt     = ag.get('vn', 0) or 0
+                media_cnt  = ag.get('media', 0) or 0
+                try:
+                    rv = await c.get_messages(e, limit=0, filter=InputMessagesFilterVoice)
+                    voices_cnt = getattr(rv, 'total', 0) or voices_cnt
+                    await asyncio.sleep(0.1)
+                    rr = await c.get_messages(e, limit=0, filter=InputMessagesFilterRoundVideo)
+                    vn_cnt = getattr(rr, 'total', 0) or vn_cnt
+                    await asyncio.sleep(0.1)
+                    rm = await c.get_messages(e, limit=0, filter=InputMessagesFilterPhotoVideo)
+                    media_cnt = getattr(rm, 'total', 0) or media_cnt
+                    await asyncio.sleep(0.1)
+                except Exception:
+                    pass  # используем данные из msg_cache если API недоступен
+
                 await db_run(
                     "INSERT INTO stats_cache"
                     "(account_id,chat_id,chat_name,username,total_msgs,out_msgs,"
@@ -1648,12 +1679,10 @@ class CM:
                     "last_date=excluded.last_date, updated_at=CURRENT_TIMESTAMP",
                     (aid, d.id, name, username, total_msgs,
                      ag.get('out', 0) or 0,
-                     ag.get('voices', 0) or 0,
-                     ag.get('vn', 0) or 0,
-                     ag.get('media', 0) or 0,
+                     voices_cnt, vn_cnt, media_cnt,
                      d.unread_count or 0, last_str)
                 )
-                await asyncio.sleep(0.05)   # не флудим API
+                await asyncio.sleep(0.15)   # не флудим API
 
             # Удаляем из кэша чаты которых больше нет в диалогах (удалены/забанены)
             live_ids = {d.id for d in dialogs if isinstance(d.entity, User) and not d.entity.bot}
@@ -1795,7 +1824,6 @@ def paginate(items, page, per=6):
 def nav(page, pages, pfx):
     row = []
     if page > 0:          row.append(b("◀️", f"{pfx}:{page-1}"))
-    row.append(b(f"{page+1}/{pages}", "noop"))
     if page < pages - 1: row.append(b("▶️", f"{pfx}:{page+1}"))
     return row
 
@@ -2544,7 +2572,7 @@ async def _bg_sync_all(aid: int):
 # ══════════════════════════════════════
 # СТАТИСТИКА
 # ══════════════════════════════════════
-_STATS_PAGE = 4   # чатов на страницу
+_STATS_PAGE = 6   # чатов на страницу
 
 def _fmt_num(n) -> str:
     n = int(n or 0)
@@ -2587,8 +2615,9 @@ async def _render_stats(bot, cid: int, mid: int, aid: int, page: int) -> None:
     page  = max(0, min(page, pages - 1))
     chunk = rows_db[page * _STATS_PAGE : (page+1) * _STATS_PAGE]
 
-    unr_txt = f"  ·  🔴 {total_unr} непрочит" if total_unr else ""
-    lines = [f"📊 <b>личные чаты</b>  ·  {total_chats} контактов{unr_txt}\n"]
+    unr_txt  = f"  ·  🔴 {total_unr} непрочит" if total_unr else ""
+    page_txt = f"  ·  {page+1}/{pages}" if pages > 1 else ""
+    lines = [f"📊 <b>личные чаты</b>  ·  {total_chats} контактов{unr_txt}{page_txt}\n"]
 
     for r in chunk:
         name = (r['chat_name'] or '?')[:20]
@@ -2607,9 +2636,8 @@ async def _render_stats(bot, cid: int, mid: int, aid: int, page: int) -> None:
     nav_btns = []
     if pages > 1:
         if page > 0:       nav_btns.append(b("◀", f"stats:{aid}:{page-1}"))
-        nav_btns.append(   b(f"{page+1}/{pages}", "noop"))
         if page < pages-1: nav_btns.append(b("▶", f"stats:{aid}:{page+1}"))
-        rows.append(nav_btns)
+        if nav_btns: rows.append(nav_btns)
 
     rows.append([b("🏆 топ чатов", f"stats_top:{aid}"), b("🔄 обновить", f"stats_refresh:{aid}")])
     rows.append([b("‹ назад", f"s_data:{aid}")])
@@ -2641,21 +2669,12 @@ async def cb_stats(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("stats_refresh:"))
 async def cb_stats_refresh(cb: CallbackQuery):
-    await cb.answer()
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: return
-    cid = cb.message.chat.id
-    mid = cb.message.message_id
-    # Показываем статус "обновляем" вместо всплывашки
-    try:
-        await cb.bot.edit_message_text(
-            "🔄 <b>обновляем статистику...</b>\n\nподжди немного, загружаем данные из Telegram",
-            chat_id=cid, message_id=mid, parse_mode='HTML'
-        )
-    except Exception: pass
-    await cm.refresh_stats_cache(aid)
-    await _render_stats(cb.bot, cid, mid, aid, 0)
+    if not acc: await cb.answer("❌"); return
+    await cb.answer("🔄 обновляем...")
+    asyncio.create_task(cm.refresh_stats_cache(aid))
+    await _render_stats(cb.bot, cb.message.chat.id, cb.message.message_id, aid, 0)
 
 
 @router.callback_query(F.data == "stats_noop")
@@ -2681,40 +2700,24 @@ async def cb_chat_detail(cb: CallbackQuery):
         (aid, chat_id)
     )
 
-    name      = (sc or {}).get('chat_name') or f"id:{chat_id}"
-    username  = (sc or {}).get('username') or ''
-    unread    = (sc or {}).get('unread') or 0
-    last      = (sc or {}).get('last_date') or '—'
-    total_api = (sc or {}).get('total_msgs') or 0
-    out_api   = (sc or {}).get('out_msgs') or 0
-    inc_api   = max(0, total_api - out_api)
-
-    # msg_cache содержит только сообщения пока бот работал — может быть пустым
-    inc_local   = (agg or {}).get('inc') or 0
-    out_local   = (agg or {}).get('out') or 0
-    total_local = (agg or {}).get('total') or 0
-
-    total = max(total_api, total_local)
-    # Если в local почти ничего — используем данные из API (stats_cache)
-    if total_api > 0 and (total_local == 0 or total_api > total_local * 2):
-        inc_c = inc_api
-        out_c = out_api
-    else:
-        inc_c = max(inc_local, inc_api)
-        out_c = max(out_local, out_api)
-
-    voices = max((sc or {}).get('voices') or 0, (agg or {}).get('voices') or 0)
-    vn     = max((sc or {}).get('videonotes') or 0, (agg or {}).get('vn') or 0)
-    media  = max((sc or {}).get('media_count') or 0, (agg or {}).get('media') or 0)
+    name     = (sc or {}).get('chat_name') or f"id:{chat_id}"
+    username = (sc or {}).get('username') or ''
+    unread   = (sc or {}).get('unread') or 0
+    last     = (sc or {}).get('last_date') or '—'
+    total_api= (sc or {}).get('total_msgs') or 0
+    inc_c    = (agg or {}).get('inc') or 0
+    out_c    = (agg or {}).get('out') or 0
+    voices   = max((sc or {}).get('voices') or 0, (agg or {}).get('voices') or 0)
+    vn       = max((sc or {}).get('videonotes') or 0, (agg or {}).get('vn') or 0)
+    media    = max((sc or {}).get('media_count') or 0, (agg or {}).get('media') or 0)
+    total    = max(total_api, (agg or {}).get('total') or 0)
 
     uname_ln = f"@{username}\n" if username else ""
     unr_ln   = f"🔴 непрочитанных: <b>{unread}</b>\n" if unread else ""
     ts       = max(total, 1)
 
-    total_line = f"💬 всего:     <b>{_fmt_num(total)}</b>\n" if total else ""
     text = (
         f"👤 <b>{name}</b>\n{uname_ln}{unr_ln}\n"
-        f"{total_line}"
         f"📥 входящих:  <code>{_bar(inc_c, ts, 6)}</code> <b>{_fmt_num(inc_c)}</b>\n"
         f"📤 исходящих: <code>{_bar(out_c, ts, 6)}</code> <b>{_fmt_num(out_c)}</b>\n\n"
         f"🎙 голосовых:  <b>{_fmt_num(voices)}</b>\n"
@@ -2804,12 +2807,14 @@ async def cb_bl(cb: CallbackQuery):
         if not acc: return
         await cm.unblock_user(aid, uid)
         bl = await cm.get_blacklist(aid)
-        # После удаления сдвигаем индекс если вышли за границу
-        new_idx = min(idx, len(bl) - 1) if bl else 0
+        # После удаления сдвигаем page если вышли за границу
         if not bl:
             await edit(cb, "📋 <b>чёрный список</b>\n\nпуст — никто не заблокирован",
                        kb([b("↻ обновить", f"bl:{aid}:0"), b("‹ назад", f"s_data:{aid}")])); return
-        await _show_bl_slide(cb, aid, bl, new_idx); return
+        per   = 4
+        pages = max(1, (len(bl) + per - 1) // per)
+        page  = min(idx, pages - 1)
+        await _show_bl_slide(cb, aid, bl, page); return
 
     # ── загрузить / переключить слайдер ──
     aid  = int(parts[1])
@@ -2827,33 +2832,34 @@ async def cb_bl(cb: CallbackQuery):
     await _show_bl_slide(cb, aid, bl, idx)
 
 
-async def _show_bl_slide(cb: CallbackQuery, aid: int, bl: list, idx: int):
-    """Слайдер: показываем одного пользователя, листаем ◀ / ▶."""
+async def _show_bl_slide(cb: CallbackQuery, aid: int, bl: list, page: int):
+    """Слайдер: показываем 4 пользователей на странице."""
+    per   = 4
     total = len(bl)
-    idx   = max(0, min(idx, total - 1))
-    u     = bl[idx]
-    tag   = f"@{u['username']}" if u['username'] else f"id:{u['id']}"
-    name  = (u['name'] or '—').strip()
+    pages = max(1, (total + per - 1) // per)
+    page  = max(0, min(page, pages - 1))
+    chunk = bl[page * per : (page + 1) * per]
 
-    text = (
-        f"📋 <b>чёрный список</b>  ·  {idx + 1} / {total}\n\n"
-        f"🚫 <b>{name}</b>\n"
-        f"🔗 <code>{tag}</code>"
-    )
+    page_txt = f"  ·  {page+1}/{pages}" if pages > 1 else ""
+    lines    = [f"📋 <b>чёрный список</b>  ·  {total} чел{page_txt}\n"]
+    for u in chunk:
+        tag  = f"@{u['username']}" if u['username'] else f"id:{u['id']}"
+        name = (u['name'] or '—').strip()
+        lines.append(f"🚫 <b>{name}</b>  <code>{tag}</code>")
+
+    rows = []
+    # Кнопки разблокировки для каждого на странице
+    for u in chunk:
+        name_s = (u['name'] or '—').strip()[:18]
+        rows.append([b(f"🔓 {name_s}", f"bl:unblock:{aid}:{u['id']}:{page}")])
 
     nav_row = []
-    if idx > 0:
-        nav_row.append(b("◀️", f"bl:{aid}:{idx - 1}"))
-    nav_row.append(b(f"{idx + 1}/{total}", "noop"))
-    if idx < total - 1:
-        nav_row.append(b("▶️", f"bl:{aid}:{idx + 1}"))
+    if page > 0:       nav_row.append(b("◀️", f"bl:{aid}:{page - 1}"))
+    if page < pages-1: nav_row.append(b("▶️", f"bl:{aid}:{page + 1}"))
+    if nav_row: rows.append(nav_row)
 
-    markup = kb(
-        nav_row,
-        [b(f"🔓 разблокировать", f"bl:unblock:{aid}:{u['id']}:{idx}")],
-        [b("🗑 очистить всё", f"bl:clr:{aid}"), b("‹ назад", f"s_data:{aid}")]
-    )
-    await edit(cb, text, markup)
+    rows.append([b("🗑 очистить всё", f"bl:clr:{aid}"), b("‹ назад", f"s_data:{aid}")])
+    await edit(cb, "\n".join(lines), kb(*rows))
 
 # ══════════════════════════════════════
 # УДАЛЁННЫЕ СООБЩЕНИЯ
@@ -3610,7 +3616,7 @@ async def cb_autodel(cb: CallbackQuery, state: FSMContext):
             f"⏰ <b>автоудаление чатов</b>\n\nправил: <b>{len(rules)}</b>",
             kb(
                 [b("📋 правила", f"autodel:{aid}:list"), b("➕ добавить", f"autodel:{aid}:add")],
-                [b("▶️ запустить сейчас", f"autodel:{aid}:run")],
+                [b("▶️ запустить сейчас", f"autodel:{aid}:preview")],
                 [b("‹ назад", f"s_auto_actions:{aid}")]
             )
         )
@@ -3659,7 +3665,7 @@ async def cb_autodel(cb: CallbackQuery, state: FSMContext):
         rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
         await edit(cb, f"⏰ <b>автоудаление чатов</b>\n\nправил: <b>{len(rules)}</b>",
             kb([b("📋 правила", f"autodel:{aid}:list"), b("➕ добавить", f"autodel:{aid}:add")],
-               [b("▶️ запустить сейчас", f"autodel:{aid}:run")],
+               [b("▶️ запустить сейчас", f"autodel:{aid}:preview")],
                [b("‹ назад", f"s_auto_actions:{aid}")])
         )
     elif action == "custom":
@@ -3671,6 +3677,63 @@ async def cb_autodel(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         cb.data = f"autodel:{aid}:list"
         await cb_autodel(cb, state)
+    elif action == "preview":
+        await cb.answer()
+        rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
+        if not rules:
+            await edit(cb, "❌ нет правил автоудаления",
+                       kb([b("➕ добавить", f"autodel:{aid}:add")],
+                          [b("‹ назад", f"autodel:{aid}:menu")])); return
+        stop = asyncio.Event()
+        asyncio.create_task(animate_loading(cb.bot, cb.message.chat.id, cb.message.message_id,
+                                            "⏰ <b>анализирую диалоги</b>", stop))
+        # Собираем превью — какие чаты будут удалены
+        c = cm.get(aid)
+        to_delete = []
+        if c:
+            try:
+                dialogs   = await c.get_dialogs(limit=500)
+                now       = datetime.now(timezone.utc).replace(tzinfo=None)
+                pinned_ids = {d.id for d in dialogs if d.pinned}
+                for rule in rules:
+                    idays     = rule.get('inactive_days', 0)
+                    chat_type = rule.get('chat_type', 'all')
+                    skip_pin  = rule.get('skip_pinned', 1)
+                    if not idays: continue
+                    for d in dialogs:
+                        if not d.date: continue
+                        if skip_pin and d.id in pinned_ids: continue
+                        e = d.entity
+                        if isinstance(e, User):    dtype = 'bot' if e.bot else 'private'
+                        elif isinstance(e, Channel): dtype = 'channel' if e.broadcast else 'group'
+                        elif isinstance(e, Chat):  dtype = 'group'
+                        else:                      dtype = 'private'
+                        if chat_type != 'all' and dtype != chat_type: continue
+                        diff = (now - d.date.replace(tzinfo=None)).days
+                        if diff >= idays:
+                            chat_nm = getattr(e, 'title', None) or getattr(e, 'first_name', '') or f"id:{d.id}"
+                            uname   = getattr(e, 'username', '') or ''
+                            to_delete.append({'name': chat_nm, 'username': uname, 'days': diff, 'dtype': dtype})
+            except Exception as ex:
+                log.error(f"autodel preview: {ex}")
+        stop.set()
+        total_del = len(to_delete)
+        if not total_del:
+            await edit(cb, "⏰ <b>автоудаление</b>\n\n✅ нет чатов подходящих под правила — удалять нечего",
+                       kb([b("‹ назад", f"autodel:{aid}:menu")])); return
+        _dtype_icons = {"private":"👤","bot":"🤖","group":"👥","channel":"📢"}
+        dlines = [f"⏰ <b>будет удалено: {total_del} чатов</b>\n"]
+        for ch in to_delete[:20]:
+            ic  = _dtype_icons.get(ch["dtype"], "💬")
+            tag = f" @{ch['username']}" if ch["username"] else ""
+            dlines.append(f"{ic} <b>{ch['name'][:22]}</b>{tag}  <i>({ch['days']} дн)</i>")
+        if total_del > 20:
+            dlines.append(f"\n…и ещё {total_del - 20} чатов")
+        dlines.append("\n⚠️ <b>это действие необратимо!</b>")
+        await edit(cb, "\n".join(dlines),
+                   kb([b(f"🗑 подтвердить удаление {total_del} чатов", f"autodel:{aid}:run")],
+                      [b("отмена", f"autodel:{aid}:menu")]))
+
     elif action == "run":
         stop = asyncio.Event()
         asyncio.create_task(animate_loading(cb.bot, cb.message.chat.id, cb.message.message_id,
@@ -3862,13 +3925,39 @@ async def cb_broadcast(cb: CallbackQuery, state: FSMContext):
         await edit(cb, "\n".join(lines), kb(*rows))
 
     elif action == "start":
-        await state.set_state(BroadcastState.message)
-        await state.update_data(aid=aid, msg_id=cb.message.message_id, chat_id=cb.message.chat.id)
+        await state.set_state(BroadcastState.content)
+        await state.update_data(aid=aid, msg_id=cb.message.message_id,
+                                chat_id=cb.message.chat.id, bcast_items=[])
         await edit(cb,
             "📢 <b>новая рассылка</b>  ·  шаг 1/2\n\n"
-            "✏️ отправь сообщение для рассылки:",
-            kb([b("отмена", f"broadcast:{aid}:menu")])
+            "✉️ отправь одно или несколько сообщений — они будут отправлены каждому получателю\n\n"
+            "поддерживается: текст, фото, видео, ГС, кружки, стикеры, файлы, GIF\n\n"
+            "когда добавишь всё — нажми <b>готово</b>",
+            kb([b("✅ готово", f"broadcast:{aid}:done")],
+               [b("отмена", f"broadcast:{aid}:menu")])
         )
+
+    elif action == "done":
+        data_d = await state.get_data()
+        items  = data_d.get('bcast_items', [])
+        if not items:
+            await cb.answer("❌ добавь хотя бы одно сообщение", show_alert=True); return
+        mid_d = data_d.get('msg_id'); cid_d = data_d.get('chat_id')
+        await state.set_state(BroadcastState.usernames)
+        cnt_label = f"{len(items)} сообщ" if len(items) > 1 else "1 сообщение"
+        try:
+            await cb.bot.edit_message_text(
+                f"📢 <b>новая рассылка</b>  ·  шаг 2/2\n\n"
+                f"контент: <b>{cnt_label}</b>\n\n"
+                f"📋 введите список получателей:\n"
+                f"• по одному @username в строку, или через запятую\n"
+                f"• максимум 100 получателей\n\n"
+                f"пример:\n<code>@user1\n@user2</code>",
+                chat_id=cid_d, message_id=mid_d,
+                reply_markup=kb([b("отмена", f"broadcast:{aid}:menu")]),
+                parse_mode='HTML'
+            )
+        except Exception: pass
 
     elif action == "stop":
         cm.stop_broadcast(aid)
@@ -3876,76 +3965,41 @@ async def cb_broadcast(cb: CallbackQuery, state: FSMContext):
         cb.data = f"broadcast:{aid}:menu"
         await cb_broadcast(cb, state)
 
-@router.message(BroadcastState.message)
-async def broadcast_message_input(msg: Message, state: FSMContext):
+@router.message(BroadcastState.content)
+async def broadcast_content_input(msg: Message, state: FSMContext):
+    """Накапливаем сообщения для рассылки (аналог DraftAdd.content)."""
     await delete_user_msg(msg)
-    data = await state.get_data()
-    aid  = data['aid']; mid = data['msg_id']; cid = data['chat_id']
+    data  = await state.get_data()
+    aid   = data['aid']; mid = data['msg_id']; cid = data['chat_id']
+    items = data.get('bcast_items', [])
 
-    # Определяем тип контента и собираем content-dict
-    content: dict = {}
-    preview_text  = ""
-
-    if msg.text:
-        content = {'type': 'text', 'text': msg.html_text or msg.text}
-        preview_text = (msg.text or '')[:200]
-    elif msg.photo:
-        f = msg.photo[-1]
-        content = {'type': 'photo', 'file_id': f.file_id,
-                   'caption': msg.html_text or msg.caption or '', 'filename': 'photo.jpg'}
-        preview_text = f"🖼 фото" + (f" — {msg.caption[:100]}" if msg.caption else "")
-    elif msg.video:
-        content = {'type': 'video', 'file_id': msg.video.file_id,
-                   'caption': msg.html_text or msg.caption or '', 'filename': 'video.mp4'}
-        preview_text = f"📹 видео" + (f" — {msg.caption[:100]}" if msg.caption else "")
-    elif msg.video_note:
-        content = {'type': 'video_note', 'file_id': msg.video_note.file_id, 'filename': 'vnote.mp4'}
-        preview_text = "🎥 видеокружок"
-    elif msg.voice:
-        content = {'type': 'voice', 'file_id': msg.voice.file_id,
-                   'caption': msg.caption or '', 'filename': 'voice.ogg'}
-        preview_text = "🎙 голосовое сообщение"
-    elif msg.audio:
-        content = {'type': 'audio', 'file_id': msg.audio.file_id,
-                   'caption': msg.html_text or msg.caption or '',
-                   'filename': msg.audio.file_name or 'audio.mp3'}
-        preview_text = f"🎵 аудио" + (f" — {msg.audio.title}" if msg.audio.title else "")
-    elif msg.sticker:
-        content = {'type': 'sticker', 'file_id': msg.sticker.file_id,
-                   'filename': f"sticker.{'tgs' if msg.sticker.is_animated else 'webp'}"}
-        preview_text = f"😊 стикер {msg.sticker.emoji or ''}"
-    elif msg.animation:
-        content = {'type': 'animation', 'file_id': msg.animation.file_id,
-                   'caption': msg.html_text or msg.caption or '', 'filename': 'anim.gif'}
-        preview_text = "🎞 GIF"
-    elif msg.document:
-        content = {'type': 'document', 'file_id': msg.document.file_id,
-                   'caption': msg.html_text or msg.caption or '',
-                   'filename': msg.document.file_name or 'file'}
-        preview_text = f"📎 документ: {msg.document.file_name or ''}"
-    else:
+    item = _msg_to_content(msg)
+    if not item:
         try:
             await msg.bot.edit_message_text(
-                "❌ тип контента не поддерживается. Отправь текст, фото, видео, ГС, стикер или документ",
+                "❌ тип контента не поддерживается\n\nОтправь текст, фото, видео, ГС, кружок, стикер, GIF или файл",
                 chat_id=cid, message_id=mid,
-                reply_markup=kb([b("отмена", f"broadcast:{aid}:menu")]),
+                reply_markup=kb([b("✅ готово", f"broadcast:{aid}:done")],
+                                [b("отмена", f"broadcast:{aid}:menu")]),
                 parse_mode='HTML'
             )
         except: pass
         return
 
-    await state.update_data(broadcast_content=content)
-    await state.set_state(BroadcastState.usernames)
+    items.append(item)
+    await state.update_data(bcast_items=items)
+    count = len(items)
+    t   = item.get('type', '?')
+    ic  = _DRAFT_ICONS.get(t, '📄')
+    lbl = _DRAFT_LABELS.get(t) or t
     try:
         await msg.bot.edit_message_text(
-            f"📢 <b>новая рассылка</b>  ·  шаг 2/2\n\n"
-            f"контент: <b>{preview_text}</b>\n\n"
-            f"📋 введите список получателей:\n"
-            f"• по одному @username в строку, или через запятую\n"
-            f"• максимум 100 получателей за раз\n\n"
-            f"пример:\n<code>@user1\n@user2\n@user3</code>",
+            f"📢 <b>новая рассылка</b>  ·  шаг 1/2\n\n"
+            f"добавлено: <b>{count}</b>  ·  последнее: {ic} {lbl}\n\n"
+            f"можешь добавить ещё или нажми <b>готово</b>",
             chat_id=cid, message_id=mid,
-            reply_markup=kb([b("отмена", f"broadcast:{aid}:menu")]),
+            reply_markup=kb([b(f"✅ готово ({count})", f"broadcast:{aid}:done")],
+                            [b("отмена", f"broadcast:{aid}:menu")]),
             parse_mode='HTML'
         )
     except: pass
@@ -3970,19 +4024,14 @@ async def broadcast_usernames_input(msg: Message, state: FSMContext):
     if not usernames:
         await upd("❌ не найдено ни одного username", kb([b("отмена", f"broadcast:{aid}:menu")])); return
 
-    content = data.get('broadcast_content', {})
+    items = data.get('bcast_items', [])
     await state.clear()
 
-    ctype        = content.get('type', 'text')
-    type_icons   = {'text':'✏️','photo':'🖼','video':'📹','video_note':'🎥',
-                    'voice':'🎙','audio':'🎵','sticker':'😊','animation':'🎞','document':'📎'}
-    preview_icon = type_icons.get(ctype, '📄')
-    preview_cap  = content.get('text') or content.get('caption') or f"[{ctype}]"
-
+    cnt_lbl = f"{len(items)} сообщ" if len(items) > 1 else "1 сообщение"
     await upd(
         f"📢 <b>подтвердите рассылку</b>\n\n"
         f"получателей: <b>{len(usernames)}</b>\n"
-        f"контент: {preview_icon} <b>{preview_cap[:120]}</b>\n\n"
+        f"контент: <b>{cnt_lbl}</b>\n\n"
         f"⚡️ задержка 5–15 сек между отправками\n"
         f"примерное время: <b>{len(usernames) * 10 // 60}–{len(usernames) * 20 // 60} мин</b>",
         kb(
@@ -3993,7 +4042,7 @@ async def broadcast_usernames_input(msg: Message, state: FSMContext):
     # Временно храним в CM
     cm._broadcasts[f"pending_{aid}"] = {
         'usernames': usernames,
-        'content':   content,
+        'items':     items,
         'mid':       mid,
         'cid':       cid,
     }
@@ -4009,7 +4058,7 @@ async def cb_broadcast_go(cb: CallbackQuery):
         await cb.answer("❌ данные рассылки устарели, начните заново"); return
 
     usernames = pending['usernames']
-    content   = pending['content']
+    items     = pending['items']
     mid       = pending['mid']
     cid       = pending['cid']
 
@@ -4038,7 +4087,7 @@ async def cb_broadcast_go(cb: CallbackQuery):
             )
         except: pass
 
-    result = await cm.broadcast(aid, cb.from_user.id, usernames, content, progress)
+    result = await cm.broadcast(aid, cb.from_user.id, usernames, items, progress)
 
     err_text = ""
     if result['errors']:
