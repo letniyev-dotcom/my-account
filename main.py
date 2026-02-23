@@ -4573,7 +4573,7 @@ async def draft_content_input(msg: Message, state: FSMContext):
 # ══════════════════════════════════════
 # 👥 МОИ ГРУППЫ И КАНАЛЫ
 # ══════════════════════════════════════
-_MYCHATS_PER_PAGE = 4
+_MYCHATS_PER_PAGE = 10
 
 @router.callback_query(F.data.startswith("mychats:"))
 async def cb_mychats(cb: CallbackQuery):
@@ -4595,34 +4595,55 @@ async def cb_mychats(cb: CallbackQuery):
     ))
 
     chats = []
+    seen_ids = set()
     try:
-        dialogs = await c.get_dialogs(limit=500)
-        for d in dialogs:
-            e = d.entity
-            if isinstance(e, (Channel, Chat)):
-                is_channel = isinstance(e, Channel) and e.broadcast
-                uname    = getattr(e, 'username', '') or ''
-                title    = getattr(e, 'title', '') or f"id:{e.id}"
-                members  = getattr(e, 'participants_count', None)
-                dtype    = 'channel' if is_channel else 'group'
-                # Для публичных — прямая ссылка, для приватных — invite link
+        # Собираем ВСЕ диалоги: обычные + архивированные, без лимита
+        async def _collect(archived_flag: bool):
+            async for d in c.iter_dialogs(archived=archived_flag):
+                e = d.entity
+                if not isinstance(e, (Channel, Chat)):
+                    continue
+                if e.id in seen_ids:
+                    continue
+                seen_ids.add(e.id)
+
+                is_channel   = isinstance(e, Channel) and getattr(e, 'broadcast', False)
+                is_megagroup = isinstance(e, Channel) and getattr(e, 'megagroup', False)
+                uname   = getattr(e, 'username', '') or ''
+                title   = getattr(e, 'title', '') or f"id:{e.id}"
+                members = getattr(e, 'participants_count', None)
+
+                if is_channel:
+                    dtype = 'channel'
+                elif is_megagroup:
+                    dtype = 'megagroup'
+                else:
+                    dtype = 'group'
+
+                # Публичные — прямая ссылка, приватные — invite link (только если мы админ)
                 if uname:
                     link = f"https://t.me/{uname}"
                 else:
+                    link = None
                     try:
-                        inv = await c(ExportChatInviteRequest(e))
+                        inv  = await c(ExportChatInviteRequest(e))
                         link = getattr(inv, 'link', None)
                     except Exception:
-                        link = None
+                        pass
+
                 chats.append({
-                    'title':   title,
-                    'uname':   uname,
-                    'dtype':   dtype,
-                    'members': members,
-                    'link':    link,
-                    'id':      e.id,
-                    'private': not bool(uname),
+                    'title':    title,
+                    'uname':    uname,
+                    'dtype':    dtype,
+                    'members':  members,
+                    'link':     link,
+                    'id':       e.id,
+                    'private':  not bool(uname),
+                    'archived': archived_flag,
                 })
+
+        await _collect(False)   # обычные диалоги
+        await _collect(True)    # архив
     except Exception as ex:
         stop.set()
         await edit(cb, f"❌ ошибка загрузки: <code>{ex}</code>",
@@ -4639,17 +4660,20 @@ async def cb_mychats(cb: CallbackQuery):
     page  = max(0, min(page, pages - 1))
     chunk = chats[page * per : (page + 1) * per]
 
-    _icons = {'channel': '📢', 'group': '👥'}
+    _icons = {'channel': '📢', 'group': '👥', 'megagroup': '💬'}
     page_txt = f"  ·  {page+1}/{pages}" if pages > 1 else ""
-    lines = [f"👥 <b>группы и каналы</b>  ·  {total} чатов{page_txt}\n"]
+    archived_count = sum(1 for ch in chats if ch.get('archived'))
+    arch_txt = f"  ·  📦 {archived_count} архив" if archived_count else ""
+    lines = [f"👥 <b>группы и каналы</b>  ·  {total} чатов{arch_txt}{page_txt}\n"]
 
     rows = []
     for ch in chunk:
-        ic      = _icons.get(ch['dtype'], '💬')
-        name    = ch['title'][:28]
-        tag     = f"  @{ch['uname']}" if ch['uname'] else '  🔒'
-        mem_txt = f"  · 👤{_fmt_num(ch['members'])}" if ch['members'] else ''
-        lines.append(f"{ic} <b>{name}</b>{tag}{mem_txt}")
+        ic       = _icons.get(ch['dtype'], '💬')
+        name     = ch['title'][:28]
+        tag      = f"  @{ch['uname']}" if ch['uname'] else '  🔒'
+        mem_txt  = f"  · 👤{_fmt_num(ch['members'])}" if ch['members'] else ''
+        arch_lbl = '  📦' if ch.get('archived') else ''
+        lines.append(f"{ic} <b>{name}</b>{tag}{mem_txt}{arch_lbl}")
         if ch.get('link'):
             label = f"{ic} {name}" + (" 🔒" if ch.get('private') else "")
             rows.append([bu(label, ch['link'])])
