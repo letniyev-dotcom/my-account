@@ -264,9 +264,6 @@ class ARState(StatesGroup):
 class SpamCfg(StatesGroup):
     value = State()
 
-class AutoDelCustom(StatesGroup):
-    days = State()
-
 class DndText(StatesGroup):
     text = State()
 
@@ -1778,40 +1775,6 @@ class CM:
         except Exception as e:
             return {'error': str(e)}
 
-    async def run_autodel(self, aid) -> int:
-        c = self.get(aid)
-        if not c: return 0
-        rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
-        if not rules: return 0
-        n = 0
-        try:
-            dialogs   = await c.get_dialogs(limit=500)
-            now       = datetime.now(timezone.utc).replace(tzinfo=None)
-            pinned_ids = {d.id for d in dialogs if d.pinned}
-            for rule in rules:
-                idays     = rule.get('inactive_days', 0)
-                chat_type = rule.get('chat_type', 'all')
-                skip_pin  = rule.get('skip_pinned', 1)
-                if not idays: continue
-                for d in dialogs:
-                    if not d.date: continue
-                    if skip_pin and d.id in pinned_ids: continue
-                    e = d.entity
-                    if isinstance(e, User):    dtype = 'bot' if e.bot else 'private'
-                    elif isinstance(e, Channel): dtype = 'channel' if e.broadcast else 'group'
-                    elif isinstance(e, Chat):  dtype = 'group'
-                    else:                      dtype = 'private'
-                    if chat_type != 'all' and dtype != chat_type: continue
-                    diff = (now - d.date.replace(tzinfo=None)).days
-                    if diff >= idays:
-                        try:
-                            await c.delete_dialog(d.entity)
-                            n += 1
-                            await asyncio.sleep(0.5)
-                        except: pass
-        except Exception as e: log.error(f"autodel {e}")
-        return n
-
 
 cm = CM()
 
@@ -1823,6 +1786,9 @@ def kb(*rows) -> InlineKeyboardMarkup:
 
 def b(text, data) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
+
+def bu(text, url) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, url=url)
 
 def paginate(items, page, per=6):
     total = len(items)
@@ -2001,6 +1967,7 @@ async def cb_s_data(cb: CallbackQuery):
             [b("🗑 удалённые",     f"dmsgs:{aid}:0"),
              b("🖼 медиа",         f"otime:{aid}:0")],
             [b("📬 непрочитанные", f"unread:{aid}:private")],
+            [b("👥 группы и каналы", f"mychats:{aid}:0")],
             [b("‹ назад",          f"acc:{aid}")]
         )
     )
@@ -2056,7 +2023,6 @@ async def cb_s_auto_actions(cb: CallbackQuery):
     if not acc: await cb.answer(); return
     await edit(cb, "⚡ <b>действия</b>",
         kb(
-            [b("⏰ автоудаление чатов",  f"autodel:{aid}:menu")],
             [b("📢 рассылка",            f"broadcast:{aid}:menu")],
             [b("🗑 удалить мои сообщ",   f"massdel:{aid}:menu")],
             [b("‹ назад", f"s_auto:{aid}")]
@@ -3607,176 +3573,6 @@ async def ar_match(cb: CallbackQuery, state: FSMContext):
 # ══════════════════════════════════════
 # АВТОУДАЛЕНИЕ
 # ══════════════════════════════════════
-@router.callback_query(F.data.startswith("autodel:"))
-async def cb_autodel(cb: CallbackQuery, state: FSMContext):
-    parts  = cb.data.split(":")
-    aid    = int(parts[1])
-    action = parts[2] if len(parts) > 2 else "menu"
-    extra  = parts[3] if len(parts) > 3 else "0"
-    acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer(); return
-
-    if action == "menu":
-        rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
-        await edit(cb,
-            f"⏰ <b>автоудаление чатов</b>\n\nправил: <b>{len(rules)}</b>",
-            kb(
-                [b("📋 правила", f"autodel:{aid}:list"), b("➕ добавить", f"autodel:{aid}:add")],
-                [b("▶️ запустить сейчас", f"autodel:{aid}:preview")],
-                [b("‹ назад", f"s_auto_actions:{aid}")]
-            )
-        )
-    elif action == "list":
-        rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
-        if not rules:
-            await edit(cb, "📋 правил нет",
-                       kb([b("➕ добавить", f"autodel:{aid}:add")],
-                          [b("‹ назад", f"autodel:{aid}:menu")])); return
-        lines = ["📋 <b>правила автоудаления</b>\n"]
-        rows  = []
-        for r in rules:
-            lines.append(f"⏰ {r['label']}  ·  тип: {r.get('chat_type','all')}")
-            rows.append([b(f"🗑 удалить #{r['id']}", f"autodel:{aid}:del:{r['id']}")])
-        rows.append([b("‹ назад", f"autodel:{aid}:menu")])
-        await edit(cb, "\n".join(lines), kb(*rows))
-    elif action == "add":
-        await edit(cb, "➕ <b>добавить правило</b>\n\nудалять чаты неактивнее:",
-            kb(
-                [b("7 дней",  f"autodel:{aid}:cfg:7"),  b("30 дней", f"autodel:{aid}:cfg:30")],
-                [b("90 дней", f"autodel:{aid}:cfg:90"), b("180 дней", f"autodel:{aid}:cfg:180")],
-                [b("✏️ своё",  f"autodel:{aid}:custom")],
-                [b("‹ назад", f"autodel:{aid}:menu")]
-            )
-        )
-    elif action == "cfg":
-        days = int(extra)
-        await edit(cb, f"➕ <b>правило >{days} дней</b>\n\nкакие чаты удалять?",
-            kb(
-                [b("🌐 все",    f"autodel:{aid}:save:{days}:all")],
-                [b("👤 личные", f"autodel:{aid}:save:{days}:private"),
-                 b("🤖 боты",   f"autodel:{aid}:save:{days}:bot")],
-                [b("👥 группы", f"autodel:{aid}:save:{days}:group"),
-                 b("📢 каналы", f"autodel:{aid}:save:{days}:channel")],
-                [b("‹ назад",   f"autodel:{aid}:add")]
-            )
-        )
-    elif action == "save":
-        days  = int(extra)
-        ctype = parts[4] if len(parts) > 4 else "all"
-        await db_run(
-            "INSERT INTO autodel_rules(account_id,label,inactive_days,chat_type,skip_pinned) VALUES(?,?,?,?,?)",
-            (aid, f">{days} дней, {ctype}", days, ctype, 1)
-        )
-        await cb.answer()
-        rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
-        await edit(cb, f"⏰ <b>автоудаление чатов</b>\n\nправил: <b>{len(rules)}</b>",
-            kb([b("📋 правила", f"autodel:{aid}:list"), b("➕ добавить", f"autodel:{aid}:add")],
-               [b("▶️ запустить сейчас", f"autodel:{aid}:preview")],
-               [b("‹ назад", f"s_auto_actions:{aid}")])
-        )
-    elif action == "custom":
-        await state.set_state(AutoDelCustom.days)
-        await state.update_data(aid=aid, msg_id=cb.message.message_id, chat_id=cb.message.chat.id)
-        await edit(cb, "✏️ введите количество дней:", kb([b("отмена", f"autodel:{aid}:add")]))
-    elif action == "del":
-        await db_run("DELETE FROM autodel_rules WHERE id=? AND account_id=?", (int(extra), aid))
-        await cb.answer()
-        cb.data = f"autodel:{aid}:list"
-        await cb_autodel(cb, state)
-    elif action == "preview":
-        await cb.answer()
-        rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
-        if not rules:
-            await edit(cb, "❌ нет правил автоудаления",
-                       kb([b("➕ добавить", f"autodel:{aid}:add")],
-                          [b("‹ назад", f"autodel:{aid}:menu")])); return
-        stop = asyncio.Event()
-        asyncio.create_task(animate_loading(cb.bot, cb.message.chat.id, cb.message.message_id,
-                                            "⏰ <b>анализирую диалоги</b>", stop))
-        # Собираем превью — какие чаты будут удалены
-        c = cm.get(aid)
-        to_delete = []
-        if c:
-            try:
-                dialogs   = await c.get_dialogs(limit=500)
-                now       = datetime.now(timezone.utc).replace(tzinfo=None)
-                pinned_ids = {d.id for d in dialogs if d.pinned}
-                for rule in rules:
-                    idays     = rule.get('inactive_days', 0)
-                    chat_type = rule.get('chat_type', 'all')
-                    skip_pin  = rule.get('skip_pinned', 1)
-                    if not idays: continue
-                    for d in dialogs:
-                        if not d.date: continue
-                        if skip_pin and d.id in pinned_ids: continue
-                        e = d.entity
-                        if isinstance(e, User):    dtype = 'bot' if e.bot else 'private'
-                        elif isinstance(e, Channel): dtype = 'channel' if e.broadcast else 'group'
-                        elif isinstance(e, Chat):  dtype = 'group'
-                        else:                      dtype = 'private'
-                        if chat_type != 'all' and dtype != chat_type: continue
-                        diff = (now - d.date.replace(tzinfo=None)).days
-                        if diff >= idays:
-                            chat_nm = getattr(e, 'title', None) or getattr(e, 'first_name', '') or f"id:{d.id}"
-                            uname   = getattr(e, 'username', '') or ''
-                            to_delete.append({'name': chat_nm, 'username': uname, 'days': diff, 'dtype': dtype})
-            except Exception as ex:
-                log.error(f"autodel preview: {ex}")
-        stop.set()
-        total_del = len(to_delete)
-        if not total_del:
-            await edit(cb, "⏰ <b>автоудаление</b>\n\n✅ нет чатов подходящих под правила — удалять нечего",
-                       kb([b("‹ назад", f"autodel:{aid}:menu")])); return
-        _dtype_icons = {"private":"👤","bot":"🤖","group":"👥","channel":"📢"}
-        dlines = [f"⏰ <b>будет удалено: {total_del} чатов</b>\n"]
-        for ch in to_delete[:20]:
-            ic  = _dtype_icons.get(ch["dtype"], "💬")
-            tag = f" @{ch['username']}" if ch["username"] else ""
-            dlines.append(f"{ic} <b>{ch['name'][:22]}</b>{tag}  <i>({ch['days']} дн)</i>")
-        if total_del > 20:
-            dlines.append(f"\n…и ещё {total_del - 20} чатов")
-        dlines.append("\n⚠️ <b>это действие необратимо!</b>")
-        await edit(cb, "\n".join(dlines),
-                   kb([b(f"🗑 подтвердить удаление {total_del} чатов", f"autodel:{aid}:run")],
-                      [b("отмена", f"autodel:{aid}:menu")]))
-
-    elif action == "run":
-        stop = asyncio.Event()
-        asyncio.create_task(animate_loading(cb.bot, cb.message.chat.id, cb.message.message_id,
-                                            "⏰ <b>запускаю автоудаление</b>", stop))
-        await cb.answer()
-        n = await cm.run_autodel(aid)
-        stop.set()
-        await edit(cb, f"✅ удалено чатов: <b>{n}</b>",
-                   kb([b("‹ назад", f"autodel:{aid}:menu")]))
-
-@router.message(AutoDelCustom.days)
-async def autodel_custom_days(msg: Message, state: FSMContext):
-    await delete_user_msg(msg)
-    data = await state.get_data()
-    aid  = data['aid']; mid = data['msg_id']; cid = data['chat_id']
-    async def upd(text, markup):
-        try: await msg.bot.edit_message_text(text, chat_id=cid, message_id=mid,
-                                              reply_markup=markup, parse_mode='HTML')
-        except: pass
-    try:
-        days = int(msg.text.strip())
-        if days < 1: raise ValueError
-        await state.clear()
-        await upd(
-            f"➕ <b>правило >{days} дней</b>\n\nкакие чаты удалять?",
-            kb(
-                [b("🌐 все",    f"autodel:{aid}:save:{days}:all")],
-                [b("👤 личные", f"autodel:{aid}:save:{days}:private"),
-                 b("🤖 боты",   f"autodel:{aid}:save:{days}:bot")],
-                [b("👥 группы", f"autodel:{aid}:save:{days}:group"),
-                 b("📢 каналы", f"autodel:{aid}:save:{days}:channel")],
-                [b("‹ назад",   f"autodel:{aid}:add")]
-            )
-        )
-    except:
-        await upd(f"❌ введите целое число > 0", kb([b("отмена", f"autodel:{aid}:add")]))
-
 # ══════════════════════════════════════
 # 🗑 МАССОВОЕ УДАЛЕНИЕ СВОИХ СООБЩЕНИЙ
 #    (выбор чата через слайдер)
@@ -4276,13 +4072,6 @@ async def cb_rm(cb: CallbackQuery):
 # ══════════════════════════════════════
 # ФОНОВЫЕ ЗАДАЧИ
 # ══════════════════════════════════════
-async def bg_autodel():
-    while True:
-        await asyncio.sleep(86400)
-        for acc in await db_all("SELECT id FROM accounts WHERE active=1"):
-            try: await cm.run_autodel(acc['id'])
-            except: pass
-
 async def bg_online_watchdog():
     while True:
         await asyncio.sleep(120)
@@ -4779,6 +4568,134 @@ async def draft_content_input(msg: Message, state: FSMContext):
 # ══════════════════════════════════════
 # ПОСЛЕДНИЙ КОД ОТ TELEGRAM
 # ══════════════════════════════════════
+
+# ══════════════════════════════════════
+# 👥 МОИ ГРУППЫ И КАНАЛЫ
+# ══════════════════════════════════════
+_MYCHATS_PER_PAGE = 4
+
+@router.callback_query(F.data.startswith("mychats:"))
+async def cb_mychats(cb: CallbackQuery):
+    await cb.answer()
+    parts = cb.data.split(":")
+    aid   = int(parts[1])
+    page  = int(parts[2]) if len(parts) > 2 else 0
+    acc   = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
+    if not acc: return
+
+    c = cm.get(aid)
+    if not c:
+        await edit(cb, "❌ аккаунт не активен", kb([b("‹ назад", f"s_data:{aid}")])); return
+
+    stop = asyncio.Event()
+    asyncio.create_task(animate_loading(
+        cb.bot, cb.message.chat.id, cb.message.message_id,
+        "👥 <b>загружаю группы и каналы</b>", stop
+    ))
+
+    chats = []
+    try:
+        dialogs = await c.get_dialogs(limit=500)
+        for d in dialogs:
+            e = d.entity
+            if isinstance(e, Channel):
+                is_channel = e.broadcast
+                is_megagroup = getattr(e, 'megagroup', False)
+                uname    = getattr(e, 'username', '') or ''
+                title    = getattr(e, 'title', '') or f"id:{e.id}"
+                members  = getattr(e, 'participants_count', None)
+                dtype    = 'channel' if is_channel else 'group'
+                link     = f"https://t.me/{uname}" if uname else None
+                chats.append({
+                    'title':   title,
+                    'uname':   uname,
+                    'dtype':   dtype,
+                    'members': members,
+                    'link':    link,
+                    'id':      e.id,
+                })
+            elif isinstance(e, Chat):
+                title   = getattr(e, 'title', '') or f"id:{e.id}"
+                members = getattr(e, 'participants_count', None)
+                chats.append({
+                    'title':   title,
+                    'uname':   '',
+                    'dtype':   'group',
+                    'members': members,
+                    'link':    None,
+                    'id':      e.id,
+                })
+    except Exception as ex:
+        stop.set()
+        await edit(cb, f"❌ ошибка загрузки: <code>{ex}</code>",
+                   kb([b("‹ назад", f"s_data:{aid}")])); return
+    stop.set()
+
+    total = len(chats)
+    if not total:
+        await edit(cb, "👥 <b>группы и каналы</b>\n\nпусто — вы не состоите ни в одной группе или канале",
+                   kb([b("‹ назад", f"s_data:{aid}")])); return
+
+    per   = _MYCHATS_PER_PAGE
+    pages = max(1, (total + per - 1) // per)
+    page  = max(0, min(page, pages - 1))
+    chunk = chats[page * per : (page + 1) * per]
+
+    _icons = {'channel': '📢', 'group': '👥'}
+    page_txt = f"  ·  {page+1}/{pages}" if pages > 1 else ""
+    lines = [f"👥 <b>группы и каналы</b>  ·  {total} чатов{page_txt}\n"]
+
+    rows = []
+    for ch in chunk:
+        ic      = _icons.get(ch['dtype'], '💬')
+        name    = ch['title'][:28]
+        tag     = f"  @{ch['uname']}" if ch['uname'] else '  🔒 приватный'
+        mem_txt = f"  · 👤{_fmt_num(ch['members'])}" if ch['members'] else ''
+        lines.append(f"{ic} <b>{name}</b>{tag}{mem_txt}")
+        if ch['link']:
+            rows.append([bu(f"{ic} {name}", ch['link'])])
+        else:
+            rows.append([b(f"{ic} {name} (приватный)", f"mychats_info:{aid}:{ch['id']}")])
+
+    nav_row = []
+    if page > 0:       nav_row.append(b("◀️", f"mychats:{aid}:{page-1}"))
+    if page < pages-1: nav_row.append(b("▶️", f"mychats:{aid}:{page+1}"))
+    if nav_row: rows.append(nav_row)
+
+    rows.append([b("🔄 обновить", f"mychats:{aid}:0"), b("‹ назад", f"s_data:{aid}")])
+    await edit(cb, "\n".join(lines), kb(*rows))
+
+
+@router.callback_query(F.data.startswith("mychats_info:"))
+async def cb_mychats_info(cb: CallbackQuery):
+    """Показывает инфо о приватной группе (без публичной ссылки)."""
+    await cb.answer()
+    parts   = cb.data.split(":")
+    aid     = int(parts[1])
+    chat_id = int(parts[2])
+    acc     = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
+    if not acc: return
+    c = cm.get(aid)
+    if not c:
+        await edit(cb, "❌ аккаунт не активен", kb([b("‹ назад", f"mychats:{aid}:0")])); return
+    try:
+        entity  = await c.get_entity(chat_id)
+        title   = getattr(entity, 'title', '') or f"id:{chat_id}"
+        members = getattr(entity, 'participants_count', None)
+        is_ch   = isinstance(entity, Channel) and entity.broadcast
+        dtype   = 'канал' if is_ch else 'группа/супергруппа'
+        mem_txt = f"\n👤 участников: <b>{_fmt_num(members)}</b>" if members else ''
+        await edit(cb,
+            f"{'📢' if is_ch else '👥'} <b>{title}</b>\n"
+            f"🔒 приватный {dtype}{mem_txt}\n\n"
+            f"публичная ссылка недоступна — чат приватный",
+            kb([b("‹ назад", f"mychats:{aid}:0")])
+        )
+    except Exception as ex:
+        await edit(cb, f"❌ ошибка: <code>{ex}</code>",
+                   kb([b("‹ назад", f"mychats:{aid}:0")]))
+
+
 @router.callback_query(F.data.startswith("tgcode:"))
 async def cb_tgcode(cb: CallbackQuery):
     await cb.answer()
@@ -4868,7 +4785,6 @@ async def main():
     cm.set_bot(bot)
     await cm.load_all()
 
-    asyncio.create_task(bg_autodel())
     asyncio.create_task(bg_online_watchdog())
     asyncio.create_task(bg_online_tracker())
 
