@@ -1529,14 +1529,20 @@ class CM:
             if not uname: continue
             try:
                 entity = await c.get_entity(uname)
-                first_item = items[0] if items else {}
-                act = 'typing' if first_item.get('type') == 'text' else 'document'
-                async with c.action(entity, act):
-                    await asyncio.sleep(random.uniform(1.5, 3.0))
+                _ACTION_MAP = {
+                    'text': 'typing',          'photo': 'upload-photo',
+                    'video': 'upload-video',   'voice': 'record-audio',
+                    'video_note': 'record-round', 'audio': 'upload-audio',
+                    'document': 'upload-document', 'sticker': 'typing',
+                    'animation': 'upload-video', 'album': 'upload-photo',
+                }
                 for item in items:
+                    act = _ACTION_MAP.get(item.get('type', 'text'), 'typing')
+                    async with c.action(entity, act):
+                        await asyncio.sleep(random.uniform(1.0, 3.0))
                     await self._send_content(c, entity, item)
                     if len(items) > 1:
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(random.uniform(1.0, 5.0))
                 sent += 1
                 await db_run("UPDATE broadcast_log SET sent=? WHERE id=?", (sent, log_id))
                 if progress_cb:
@@ -1555,9 +1561,12 @@ class CM:
                 try:
                     entity = await c.get_entity(uname)
                     for item in items:
+                        act = _ACTION_MAP.get(item.get('type', 'text'), 'typing')
+                        async with c.action(entity, act):
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
                         await self._send_content(c, entity, item)
                         if len(items) > 1:
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(random.uniform(1.0, 5.0))
                     sent += 1
                 except Exception as e2:
                     failed += 1; errors.append(f"@{uname}: {e2}")
@@ -3984,14 +3993,17 @@ async def broadcast_content_input(msg: Message, state: FSMContext):
 
     items.append(item)
     await state.update_data(bcast_items=items)
+    import json as _jb
     count = len(items)
     t   = item.get('type', '?')
     ic  = _DRAFT_ICONS.get(t, '📄')
     lbl = _DRAFT_LABELS.get(t) or t
+    _, summary, _ = _draft_summary(_jb.dumps(items, ensure_ascii=False))
     try:
         await msg.bot.edit_message_text(
             f"📢 <b>новая рассылка</b>  ·  шаг 1/2\n\n"
             f"добавлено: <b>{count}</b>  ·  последнее: {ic} {lbl}\n\n"
+            f"<blockquote expandable>{summary[:400]}</blockquote>\n\n"
             f"можешь добавить ещё или нажми <b>готово</b>",
             chat_id=cid, message_id=mid,
             reply_markup=kb([b(f"✅ готово ({count})", f"broadcast:{aid}:done")],
