@@ -1962,7 +1962,7 @@ async def cb_accs(cb: CallbackQuery):
 async def cb_acc(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌ нет доступа"); return
+    if not acc: await cb.answer(); return
     st    = "🟢 онлайн" if cm.get(aid) else "🔴 офлайн"
     icons = ""
     if acc.get('always_online'): icons += " 🌐"
@@ -1984,7 +1984,7 @@ async def cb_acc(cb: CallbackQuery):
 async def cb_s_data(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     await edit(cb, "📊 <b>данные</b>",
         kb(
             [b("📊 статистика",    f"stats:{aid}:0"),
@@ -2001,7 +2001,7 @@ async def cb_s_data(cb: CallbackQuery):
 async def cb_s_auto(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     await edit(cb, "🤖 <b>автоматизация</b>",
         kb(
             [b("💬 ответы и сообщения",  f"s_auto_replies:{aid}")],
@@ -2015,7 +2015,7 @@ async def cb_s_auto(cb: CallbackQuery):
 async def cb_s_auto_replies(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     ar  = "✅" if acc.get('autoreply_on') else "☐"
     dnd = "✅" if acc.get('dnd_mode')     else "☐"
     await edit(cb, "💬 <b>ответы и сообщения</b>",
@@ -2031,7 +2031,7 @@ async def cb_s_auto_replies(cb: CallbackQuery):
 async def cb_s_auto_monitor(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     await edit(cb, "👁 <b>мониторинг</b>",
         kb(
             [b("🔔 ключевые слова",   f"kw:{aid}:list")],
@@ -2044,7 +2044,7 @@ async def cb_s_auto_monitor(cb: CallbackQuery):
 async def cb_s_auto_actions(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     await edit(cb, "⚡ <b>действия</b>",
         kb(
             [b("⏰ автоудаление чатов",  f"autodel:{aid}:menu")],
@@ -2060,7 +2060,7 @@ async def cb_s_auto_actions(cb: CallbackQuery):
 async def cb_s_prot(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     sec  = "✅" if acc.get('security_mode') else "☐"
     await edit(cb, "🛡 <b>защита аккаунта</b>",
         kb(
@@ -2076,7 +2076,7 @@ async def cb_s_prot(cb: CallbackQuery):
 async def cb_s_mode(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     ao = "✅" if acc.get('always_online') else "☐"
     ar = "✅" if acc.get('auto_read')     else "☐"
     await edit(cb, f"👻 <b>режимы работы</b>",
@@ -2093,7 +2093,7 @@ async def cb_mode_tog(cb: CallbackQuery):
     parts = cb.data.split(":")
     aid, mode = int(parts[1]), parts[2]
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     if mode == "online":
         new = 0 if acc.get('always_online') else 1
         await cm.set_always_online(aid, bool(new))
@@ -2120,7 +2120,7 @@ async def cb_mode_tog(cb: CallbackQuery):
 async def cb_autoread_cfg(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     flt = acc.get('auto_read_filter', 'all')
     def _mark(typ): return "✅" if (flt == 'all' or (flt != 'none' and typ in flt.split(','))) else "☐"
     await edit(cb,
@@ -2141,7 +2141,7 @@ async def cb_ar_flt(cb: CallbackQuery):
     parts = cb.data.split(":")
     aid, typ = int(parts[1]), parts[2]
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     flt = acc.get('auto_read_filter', 'all')
     if typ == 'all':
         new_flt = 'none' if flt == 'all' else 'all'
@@ -2175,7 +2175,7 @@ async def cb_ar_flt(cb: CallbackQuery):
 async def cb_s_cfg(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     nd = "✅" if acc.get('notify_deleted', 1) else "❌"
     nm = "✅" if acc.get('notify_media', 1)   else "❌"
     await edit(cb, "⚙️ <b>уведомления</b>",
@@ -2192,7 +2192,7 @@ async def cb_cfg_tog(cb: CallbackQuery):
     aid   = int(parts[1])
     field = parts[2]
     acc   = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     if field not in ('notify_deleted', 'notify_media'): await cb.answer(); return
     new = 0 if acc.get(field, 1) else 1
     await db_run(f"UPDATE accounts SET {field}=? WHERE id=?", (new, aid))
@@ -2389,18 +2389,15 @@ async def auth_code_btn(cb: CallbackQuery, state: FSMContext):
                 from telethon.tl.functions.auth import ResendCodeRequest
                 data2 = await state.get_data()
                 await client(ResendCodeRequest(phone, data2['hash']))
-                await cb.answer("📞 звонок заказан, ждите...", show_alert=True)
+                await cb.answer()
             except Exception as ex:
                 err = str(ex)
                 if "SEND_CODE_UNAVAILABLE" in err or "all available options" in err.lower():
-                    await cb.answer(
-                        "⚠️ все способы доставки исчерпаны — проверьте уведомления в Telegram или повторите добавление позже",
-                        show_alert=True
-                    )
+                    await cb.answer()
                 else:
-                    await cb.answer(f"❌ ошибка: {err[:150]}", show_alert=True)
+                    await cb.answer()
         else:
-            await cb.answer("❌ сессия истекла, перезапустите добавление", show_alert=True)
+            await cb.answer()
         return
     if digit == '⌫':
         code = code[:-1]
@@ -2671,8 +2668,8 @@ async def cb_stats(cb: CallbackQuery):
 async def cb_stats_refresh(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
-    await cb.answer("🔄 обновляем...")
+    if not acc: await cb.answer(); return
+    await cb.answer()
     asyncio.create_task(cm.refresh_stats_cache(aid))
     await _render_stats(cb.bot, cb.message.chat.id, cb.message.message_id, aid, 0)
 
@@ -2873,7 +2870,7 @@ async def cb_dmsgs(cb: CallbackQuery):
         await edit(cb, "✅ история очищена", kb([b("‹ назад", f"s_data:{aid}")])); return
     aid, page = int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     msgs = await db_all("SELECT * FROM deleted_msgs WHERE account_id=? ORDER BY deleted_at DESC", (aid,))
     if not msgs:
         await edit(cb, "🗑 <b>удалённые</b>\n\nпока ничего нет",
@@ -2904,7 +2901,7 @@ async def cb_otime(cb: CallbackQuery):
         await edit(cb, "✅ история очищена", kb([b("‹ назад", f"s_data:{aid}")])); return
     aid, page = int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     media = await db_all("SELECT * FROM onetime_media WHERE account_id=? ORDER BY saved_at DESC", (aid,))
     if not media:
         await edit(cb, "🔐 <b>одноразовые медиа</b>\n\nпока ничего нет",
@@ -2929,7 +2926,7 @@ async def cb_dnd(cb: CallbackQuery, state: FSMContext):
     aid    = int(parts[1])
     action = parts[2] if len(parts) > 2 else "menu"
     acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     if action == "toggle":
         new = 0 if acc.get('dnd_mode') else 1
         await db_run("UPDATE accounts SET dnd_mode=? WHERE id=?", (new, aid))
@@ -2952,7 +2949,7 @@ async def cb_dnd(cb: CallbackQuery, state: FSMContext):
 async def cb_dnd_edit(cb: CallbackQuery, state: FSMContext):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     await state.set_state(DndText.text)
     await state.update_data(aid=aid, msg_id=cb.message.message_id, chat_id=cb.message.chat.id)
     await edit(cb, "✏️ введите новый текст автоответа:", kb([b("отмена", f"dnd:{aid}:menu")]))
@@ -2989,7 +2986,7 @@ async def cb_unread(cb: CallbackQuery):
     aid    = int(parts[1])
     filter_type = parts[2] if len(parts) > 2 else "private"   # по умолчанию — личные
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     stop = asyncio.Event()
     anim = asyncio.create_task(animate_loading(cb.bot, cb.message.chat.id, cb.message.message_id,
                                                "📬 <b>загружаю непрочитанные</b>", stop))
@@ -3044,10 +3041,10 @@ async def cb_unread_readall(cb: CallbackQuery):
     aid         = int(parts[1])
     filter_type = parts[2] if len(parts) > 2 else "private"
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     c = cm.get(aid)
     if not c:
-        await cb.answer("❌ клиент не активен"); return
+        await cb.answer(); return
 
     stop = asyncio.Event()
     anim = asyncio.create_task(animate_loading(cb.bot, cb.message.chat.id, cb.message.message_id,
@@ -3275,7 +3272,7 @@ async def spam_cfg_msg(msg: Message, state: FSMContext):
 async def cb_sec_toggle(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     new = 0 if acc.get('security_mode', 0) else 1
     await db_run("UPDATE accounts SET security_mode=? WHERE id=?", (new, aid))
     await cb.answer()
@@ -3297,7 +3294,7 @@ async def cb_sec_toggle(cb: CallbackQuery):
 async def cb_chk(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     await cb.answer()
     stop = asyncio.Event()
     anim = asyncio.create_task(animate_loading(cb.bot, cb.message.chat.id, cb.message.message_id,
@@ -3340,7 +3337,7 @@ async def cb_ar(cb: CallbackQuery, state: FSMContext):
     action = parts[2] if len(parts) > 2 else "menu"
     extra  = parts[3] if len(parts) > 3 else "0"
     acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
     if action == "menu":
         await _ar_menu(cb, aid, acc)
     elif action == "toggle":
@@ -3394,7 +3391,7 @@ async def cb_ar(cb: CallbackQuery, state: FSMContext):
     elif action == "sched":
         rid  = int(extra)
         rule = await db_get("SELECT * FROM autoreply_rules WHERE id=? AND account_id=?", (rid, aid))
-        if not rule: await cb.answer("❌"); return
+        if not rule: await cb.answer(); return
         ss = rule.get('schedule_start') or ''
         se = rule.get('schedule_end')   or ''
         sch_txt = f"{ss}–{se}" if ss and se else "не задано"
@@ -3546,7 +3543,7 @@ async def ar_done(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     items = data.get('ar_items', [])
     if not items:
-        await cb.answer("⚠️ добавь хотя бы одно сообщение", show_alert=True)
+        await cb.answer()
         return
     await state.set_state(ARState.match)
     cid = data['chat_id']; mid = data['msg_id']
@@ -3608,7 +3605,7 @@ async def cb_autodel(cb: CallbackQuery, state: FSMContext):
     action = parts[2] if len(parts) > 2 else "menu"
     extra  = parts[3] if len(parts) > 3 else "0"
     acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
 
     if action == "menu":
         rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
@@ -3661,7 +3658,7 @@ async def cb_autodel(cb: CallbackQuery, state: FSMContext):
             "INSERT INTO autodel_rules(account_id,label,inactive_days,chat_type,skip_pinned) VALUES(?,?,?,?,?)",
             (aid, f">{days} дней, {ctype}", days, ctype, 1)
         )
-        await cb.answer("✅ правило добавлено")
+        await cb.answer()
         rules = await db_all("SELECT * FROM autodel_rules WHERE account_id=?", (aid,))
         await edit(cb, f"⏰ <b>автоудаление чатов</b>\n\nправил: <b>{len(rules)}</b>",
             kb([b("📋 правила", f"autodel:{aid}:list"), b("➕ добавить", f"autodel:{aid}:add")],
@@ -3781,7 +3778,7 @@ async def cb_massdel(cb: CallbackQuery):
     aid    = int(parts[1])
     action = parts[2] if len(parts) > 2 else "menu"
     acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
 
     if action == "menu":
         await edit(cb,
@@ -3902,7 +3899,7 @@ async def cb_broadcast(cb: CallbackQuery, state: FSMContext):
     aid    = int(parts[1])
     action = parts[2] if len(parts) > 2 else "menu"
     acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
 
     if action == "menu":
         # Последние рассылки
@@ -3930,8 +3927,7 @@ async def cb_broadcast(cb: CallbackQuery, state: FSMContext):
                                 chat_id=cb.message.chat.id, bcast_items=[])
         await edit(cb,
             "📢 <b>новая рассылка</b>  ·  шаг 1/2\n\n"
-            "✉️ отправь одно или несколько сообщений — они будут отправлены каждому получателю\n\n"
-            "поддерживается: текст, фото, видео, ГС, кружки, стикеры, файлы, GIF\n\n"
+            "✉️ отправь сообщения для рассылки\n\n"
             "когда добавишь всё — нажми <b>готово</b>",
             kb([b("✅ готово", f"broadcast:{aid}:done")],
                [b("отмена", f"broadcast:{aid}:menu")])
@@ -3941,7 +3937,7 @@ async def cb_broadcast(cb: CallbackQuery, state: FSMContext):
         data_d = await state.get_data()
         items  = data_d.get('bcast_items', [])
         if not items:
-            await cb.answer("❌ добавь хотя бы одно сообщение", show_alert=True); return
+            await cb.answer(); return
         mid_d = data_d.get('msg_id'); cid_d = data_d.get('chat_id')
         await state.set_state(BroadcastState.usernames)
         cnt_label = f"{len(items)} сообщ" if len(items) > 1 else "1 сообщение"
@@ -4051,11 +4047,11 @@ async def broadcast_usernames_input(msg: Message, state: FSMContext):
 async def cb_broadcast_go(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
 
     pending = cm._broadcasts.pop(f"pending_{aid}", None)
     if not pending:
-        await cb.answer("❌ данные рассылки устарели, начните заново"); return
+        await cb.answer(); return
 
     usernames = pending['usernames']
     items     = pending['items']
@@ -4119,7 +4115,7 @@ async def cb_kw(cb: CallbackQuery, state: FSMContext):
     aid    = int(parts[1])
     action = parts[2] if len(parts) > 2 else "list"
     acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
 
     if action == "list":
         kws = await db_all("SELECT * FROM keyword_alerts WHERE account_id=? ORDER BY id", (aid,))
@@ -4184,7 +4180,7 @@ async def cb_ot(cb: CallbackQuery, state: FSMContext):
     aid    = int(parts[1])
     action = parts[2] if len(parts) > 2 else "list"
     acc    = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
+    if not acc: await cb.answer(); return
 
     if action == "list":
         tracked = await db_all("SELECT * FROM online_tracker WHERE account_id=? ORDER BY peer_name", (aid,))
@@ -4259,7 +4255,7 @@ async def cb_rm(cb: CallbackQuery):
         ); return
     aid = int(parts[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌ нет доступа"); return
+    if not acc: await cb.answer(); return
     await edit(cb,
         f"🚪 <b>выйти из аккаунта?</b>\n\n📱 <code>{acc['phone']}</code>\n\nданные сохранятся",
         kb([b("✅ да, выйти", f"rm:ok:{aid}"), b("отмена", f"acc:{aid}")])
@@ -4777,7 +4773,7 @@ async def cb_tgcode(cb: CallbackQuery):
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
     if not acc:
-        await cb.answer("❌ нет доступа", show_alert=True)
+        await cb.answer()
         return
 
     row = await db_get(
@@ -4816,6 +4812,32 @@ async def cb_tgcode(cb: CallbackQuery):
 # ══════════════════════════════════════
 # ЗАПУСК
 # ══════════════════════════════════════
+
+async def _send_startup_notifications(bot: Bot) -> None:
+    """При старте бота — уведомляет всех пользователей об обновлении."""
+    await asyncio.sleep(2)   # дать боту полностью запуститься
+    try:
+        users = await db_all("SELECT DISTINCT user_id FROM accounts")
+        if not users:
+            # Если аккаунтов нет — пробуем из ALLOWED_USERS
+            users = [{'user_id': uid} for uid in ALLOWED_USERS] if ALLOWED_USERS else []
+        for row in users:
+            uid = row['user_id']
+            try:
+                await bot.send_message(
+                    uid,
+                    "🔄 <b>бот был обновлён</b>\n\n"
+                    "все привязанные аккаунты отключены — необходимо повторить привязку",
+                    reply_markup=kb([b("➕ добавить аккаунт", "accs:0")]),
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                log.warning(f"startup notify {uid}: {e}")
+            await asyncio.sleep(0.3)
+    except Exception as e:
+        log.error(f"_send_startup_notifications: {e}")
+
+
 async def main():
     # Проверка обязательных переменных окружения
     for var in ("BOT_TOKEN", "API_ID", "API_HASH"):
@@ -4839,6 +4861,10 @@ async def main():
     asyncio.create_task(bg_online_tracker())
 
     log.info("🤖 Bot v3.0 started!")
+
+    # ── уведомление об обновлении всем пользователям ──
+    asyncio.create_task(_send_startup_notifications(bot))
+
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
