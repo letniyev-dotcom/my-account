@@ -254,12 +254,9 @@ class Auth(StatesGroup):
     password = State()
 
 class ARState(StatesGroup):
-    trigger      = State()
-    content_type = State()   # choose text/voice/photo/video/etc
-    response     = State()   # text input
-    media        = State()   # media upload
-    btn_add      = State()   # adding buttons (text|url format)
-    match        = State()
+    trigger = State()   # шаг 1: триггеры (по одному на строку)
+    content = State()   # шаг 2: накапливаем сообщения (как черновик)
+    match   = State()   # шаг 3: тип совпадения
 
 class SpamCfg(StatesGroup):
     value = State()
@@ -612,7 +609,7 @@ class CM:
             try: await c.disconnect()
             except: pass
         c = TelegramClient(StringSession(acc['session_string']), API_ID, API_HASH,
-            device_model="Samsung Galaxy S25 Ultra",
+            device_model="Galaxy S25 Ultra",
             system_version="Android 15",
             app_version="12.4.3",
             connection_retries=5,
@@ -847,6 +844,41 @@ class CM:
                     await ev.message.delete()
                 except: pass
                 return
+        except: pass
+
+        # ── "..." — редактировать своё сообщение через реплай ──
+        # отвечаешь на своё сообщение текстом начинающимся с "..."
+        # то сообщение на которое ответил изменится на новый текст
+        try:
+            raw_text = (ev.message.message or '')
+            reply_id = ev.message.reply_to_msg_id
+            if reply_id and raw_text.startswith('...'):
+                new_text = raw_text[3:].lstrip('\n')  # убираем "..." и необязательный перенос
+                try:
+                    # Проверяем что цитируемое — наше сообщение
+                    orig = await c.get_messages(ev.chat_id, ids=reply_id)
+                    if orig and orig.out:
+                        # Переносим entities с корректировкой смещения
+                        shift = len(raw_text) - len(new_text)
+                        raw_ents = ev.message.entities or []
+                        adjusted_ents = []
+                        for e in raw_ents:
+                            no = e.offset - shift
+                            if no >= 0 and no + e.length <= len(new_text):
+                                try:
+                                    import copy as _copy
+                                    ne = _copy.copy(e)
+                                    ne.offset = no
+                                    adjusted_ents.append(ne)
+                                except: pass
+                        kw = {'link_preview': False}
+                        if adjusted_ents:
+                            kw['formatting_entities'] = adjusted_ents
+                        await c.edit_message(ev.chat_id, reply_id, new_text, **kw)
+                        await ev.message.delete()
+                        return
+                except Exception as e:
+                    log.debug(f"... edit failed: {e}")
         except: pass
 
         # Кэшируем исходящие — ищем aid по клиенту
@@ -1209,36 +1241,32 @@ class CM:
                         if not (now_h >= s_min or now_h <= e_min): continue
                 except: pass
 
-            t   = (r.get('trig') or r.get('trigger_text') or '').lower()
+            # Поддержка нескольких триггеров через "|"
+            raw_trig = r.get('trig') or r.get('trigger_text') or ''
+            triggers = [t.strip().lower() for t in raw_trig.split('|') if t.strip()]
             m   = r.get('match_type', 'contains')
-            hit = (m == 'exact' and text == t) or \
-                  (m == 'contains' and t in text) or \
-                  (m == 'startswith' and text.startswith(t))
+            hit = False
+            for t in triggers:
+                if (m == 'exact' and text == t) or \
+                   (m == 'contains' and t in text) or \
+                   (m == 'startswith' and text.startswith(t)):
+                    hit = True
+                    break
             if not hit: continue
             try:
-                # Строим URL-кнопки если заданы
-                buttons = None
-                btns_raw = r.get('buttons_json') or ''
-                if btns_raw:
-                    try:
-                        from telethon.tl.types import KeyboardButtonUrl, ReplyInlineMarkup, KeyboardButtonRow
-                        btn_data = _json.loads(btns_raw)
-                        tg_rows = []
-                        for row in btn_data:
-                            row_btns = [KeyboardButtonUrl(text=btn['text'], url=btn['url']) for btn in row]
-                            tg_rows.append(KeyboardButtonRow(buttons=row_btns))
-                        if tg_rows: buttons = ReplyInlineMarkup(rows=tg_rows)
-                    except: pass
-
                 content_raw = r.get('content_json') or ''
                 if content_raw:
-                    content = _json.loads(content_raw)
-                    await self._send_content(c, ev.chat_id, content,
-                                             reply_to=ev.message.id, buttons=buttons)
+                    content_data = _json.loads(content_raw)
+                    # Поддержка как списка (новый формат), так и одиночного объекта
+                    items = content_data if isinstance(content_data, list) else [content_data]
+                    for i, item in enumerate(items):
+                        reply_to = ev.message.id if i == 0 else None
+                        await self._send_content(c, ev.chat_id, item, reply_to=reply_to)
+                        if i < len(items) - 1:
+                            await asyncio.sleep(0.3)
                 else:
                     resp = r.get('response') or r.get('response_text') or ''
-                    await c.send_message(ev.chat_id, resp, reply_to=ev.message.id,
-                                         parse_mode='html', buttons=buttons)
+                    await c.send_message(ev.chat_id, resp, reply_to=ev.message.id, parse_mode='html')
             except: pass
             break
 
@@ -2199,7 +2227,7 @@ async def auth_phone(msg: Message, state: FSMContext):
 
     client = TelegramClient(
         StringSession(), API_ID, API_HASH,
-        device_model="Samsung Galaxy S25 Ultra",
+        device_model="Galaxy S25 Ultra",
         system_version="Android 15",
         app_version="12.4.3",
         lang_code="ru",
@@ -2271,7 +2299,7 @@ async def auth_phone(msg: Message, state: FSMContext):
                 )
                 retry_client = TelegramClient(
                     StringSession(), API_ID, API_HASH,
-                    device_model="Samsung Galaxy S25 Ultra",
+                    device_model="Galaxy S25 Ultra",
                     system_version="Android 15",
                     app_version="12.4.3",
                     lang_code="ru",
@@ -3059,7 +3087,7 @@ async def cb_spam_cfg(cb: CallbackQuery, state: FSMContext):
     if not acc: return
 
     if action == "menu":
-        await edit(cb, "⚙️ <b>настройки антиспама</b>\n\nФильтры срабатывают дополнительно к порогу частоты", _spam_cfg_kb(aid, acc))
+        await edit(cb, "⚙️ <b>настройки антиспама</b>\n\nфильтры срабатывают дополнительно к порогу частоты", _spam_cfg_kb(aid, acc))
 
     elif action == "tog":
         field_map = {
@@ -3116,8 +3144,8 @@ async def cb_spam_cfg(cb: CallbackQuery, state: FSMContext):
         wl   = await db_all("SELECT * FROM antispam_whitelist WHERE account_id=?", (aid,))
         if not wl:
             await edit(cb,
-                "👥 <b>белый список антиспама</b>\n\nПуст — все проверяются.\n\n"
-                "Добавленные пользователи не будут подпадать под фильтры.",
+                "👥 <b>белый список антиспама</b>\n\nпуст — все проверяются.\n\n"
+                "добавленные пользователи не будут подпадать под фильтры.",
                 kb([b("➕ добавить", f"spam_cfg:{aid}:wl_add"),
                     b("‹ назад", f"spam_cfg:{aid}:menu")])
             ); return
@@ -3145,7 +3173,7 @@ async def cb_spam_cfg(cb: CallbackQuery, state: FSMContext):
         await state.update_data(aid=aid, msg_id=cb.message.message_id,
                                 chat_id=cb.message.chat.id, spam_field='wl_add')
         await edit(cb,
-            "👥 <b>добавить в белый список</b>\n\nВведите @username или числовой ID:",
+            "👥 <b>добавить в белый список</b>\n\nвведите @username или числовой ID:",
             kb([b("отмена", f"spam_cfg:{aid}:wl:0")])
         )
 
@@ -3302,14 +3330,25 @@ async def cb_ar(cb: CallbackQuery, state: FSMContext):
         rows  = []
         for r in chunk:
             st2  = "✅" if r['active'] else "❌"
-            trig = (r.get('trig') or r.get('trigger_text') or '?')[:20]
-            resp = (r.get('response') or r.get('response_text') or '')[:25]
+            raw_trig = (r.get('trig') or r.get('trigger_text') or '?')
+            # Показываем все триггеры через " | "
+            trigs = [t.strip() for t in raw_trig.split('|') if t.strip()]
+            trig_display = ' | '.join(trigs)[:25]
+            import json as _jl
+            cj = r.get('content_json') or ''
+            count_label = ''
+            if cj:
+                try:
+                    items_l = _jl.loads(cj)
+                    if isinstance(items_l, list) and len(items_l) > 1:
+                        count_label = f" · {len(items_l)} сообщ"
+                except: pass
             sch  = ""
             if r.get('schedule_start') and r.get('schedule_end'):
                 sch = f" 🕐{r['schedule_start']}-{r['schedule_end']}"
-            lines.append(f"{st2} <code>{trig}</code> → {resp}{sch}")
+            lines.append(f"{st2} <code>{trig_display}</code>{count_label}{sch}")
             rows.append([
-                b(f"🗑 {trig[:15]}", f"ar:{aid}:del:{r['id']}"),
+                b(f"🗑 {trig_display[:15]}", f"ar:{aid}:del:{r['id']}"),
                 b(f"🕐 расписание", f"ar:{aid}:sched:{r['id']}")
             ])
         if pages > 1: rows.append(nav(page, pages, f"ar:{aid}:list"))
@@ -3341,8 +3380,8 @@ async def cb_ar(cb: CallbackQuery, state: FSMContext):
         await state.set_state(ARState.trigger)
         await state.update_data(aid=aid, msg_id=cb.message.message_id, chat_id=cb.message.chat.id)
         await edit(cb,
-            "➕ <b>новое правило</b>  ·  шаг 1/5\n\n"
-            "введите слово-триггер (или фразу):",
+            "➕ <b>новое правило</b>  ·  шаг 1/3\n\n"
+            "введите триггер или несколько триггеров — каждый с новой строки:",
             kb([b("отмена", f"ar:{aid}:menu")])
         )
 
@@ -3350,194 +3389,146 @@ async def cb_ar(cb: CallbackQuery, state: FSMContext):
 async def ar_trigger(msg: Message, state: FSMContext):
     await delete_user_msg(msg)
     data = await state.get_data()
-    trig = msg.text.strip() if msg.text else ""
-    if not trig: return
-    await state.update_data(trig=trig)
-    await state.set_state(ARState.content_type)
+    raw = (msg.text or '').strip()
+    if not raw:
+        return
+    # Парсим триггеры: каждый на новой строке
+    triggers = [t.strip() for t in raw.splitlines() if t.strip()]
+    if not triggers:
+        return
+    trig_str = ' | '.join(triggers)  # для отображения
+    trig_db  = '|'.join(triggers)    # для хранения в БД
+    await state.update_data(ar_trig=trig_db, ar_trig_display=trig_str, ar_items=[], ar_album_buf={})
+    await state.set_state(ARState.content)
     try:
         await msg.bot.edit_message_text(
-            f"➕ <b>новое правило</b>  ·  шаг 2/5\n\n"
-            f"триггер: <code>{trig}</code>\n\n"
-            f"выберите тип ответа:",
+            f"➕ <b>новое правило</b>  ·  шаг 2/3\n\n"
+            f"триггер(ы): <code>{trig_str[:200]}</code>\n\n"
+            f"отправь одно или несколько сообщений — они все будут отправляться по триггеру\n"
+            f"когда закончишь — нажми <b>готово</b>",
             chat_id=data['chat_id'], message_id=data['msg_id'],
-            reply_markup=kb(
-                [b("✏️ текст",   "ar_ct:text"),   b("🎙 голосовое", "ar_ct:voice")],
-                [b("🖼 фото",    "ar_ct:photo"),  b("📹 видео",     "ar_ct:video")],
-                [b("🎞 гиф",    "ar_ct:animation"), b("📎 файл",   "ar_ct:document")],
-                [b("🎵 аудио",  "ar_ct:audio"),  b("😊 стикер",    "ar_ct:sticker")],
-                [b("отмена", f"ar:{data['aid']}:menu")]
-            ), parse_mode='HTML'
+            reply_markup=kb([
+                b("✅ готово", f"ar_done:{data['aid']}"),
+                b("отмена",   f"ar:{data['aid']}:menu"),
+            ]),
+            parse_mode='HTML'
         )
     except: pass
 
-@router.callback_query(F.data.startswith("ar_ct:"), ARState.content_type)
-async def ar_content_type(cb: CallbackQuery, state: FSMContext):
-    ctype = cb.data.split(":")[1]
+
+@router.message(ARState.content)
+async def ar_content_input(msg: Message, state: FSMContext):
+    await delete_user_msg(msg)
     data  = await state.get_data()
-    await state.update_data(ar_ctype=ctype)
+    aid   = data['aid']; mid = data['msg_id']; cid = data['chat_id']
+    trig_str = data.get('ar_trig_display', '')
+    items = data.get('ar_items', [])
+    album_buf = data.get('ar_album_buf', {})
+
+    # ── Альбом ──
+    group_id = msg.media_group_id
+    if group_id:
+        grp_key = str(group_id)
+        item = _msg_to_content(msg)
+        if not item:
+            return
+        if grp_key not in album_buf:
+            album_buf[grp_key] = []
+        album_buf[grp_key].append(item)
+        await state.update_data(ar_album_buf=album_buf)
+
+        pending = data.get('ar_album_tasks', {})
+        if grp_key in pending:
+            try: pending[grp_key].cancel()
+            except: pass
+
+        async def _flush_ar_album(gk=grp_key):
+            await asyncio.sleep(1.0)
+            d2 = await state.get_data()
+            buf2 = d2.get('ar_album_buf', {})
+            group_items = buf2.pop(gk, [])
+            if not group_items:
+                return
+            itms2 = d2.get('ar_items', [])
+            cap = next((i.get('caption', '') for i in group_items if i.get('caption')), '')
+            album_item = {'type': 'album', 'items': group_items, 'caption': cap}
+            itms2.append(album_item)
+            await state.update_data(ar_items=itms2, ar_album_buf=buf2)
+            import json as _j2
+            _, summ, _ = _draft_summary(_j2.dumps(itms2))
+            try:
+                await msg.bot.edit_message_text(
+                    f"➕ <b>новое правило</b>  ·  шаг 2/3\n\n"
+                    f"триггер(ы): <code>{trig_str[:200]}</code>\n"
+                    f"добавлено: <b>{len(itms2)}</b>  ·  последнее: 🗂 альбом ({len(group_items)} шт)\n\n"
+                    f"<blockquote expandable>{summ[:400]}</blockquote>\n\n"
+                    f"можешь отправить ещё или нажать <b>готово</b>",
+                    chat_id=cid, message_id=mid,
+                    reply_markup=kb([
+                        b(f"✅ готово ({len(itms2)})", f"ar_done:{aid}"),
+                        b("отмена", f"ar:{aid}:menu"),
+                    ]),
+                    parse_mode='HTML'
+                )
+            except: pass
+
+        task = asyncio.create_task(_flush_ar_album())
+        pending[grp_key] = task
+        await state.update_data(ar_album_tasks=pending)
+        return
+
+    # ── Одиночное сообщение ──
+    item = _msg_to_content(msg)
+    if not item:
+        return
+
+    items.append(item)
+    await state.update_data(ar_items=items)
+
+    import json as _j
+    count = len(items)
+    _, summary, _ = _draft_summary(_j.dumps(items))
+    t  = item.get('type', '?')
+    ic = _DRAFT_ICONS.get(t, '📄')
+    lbl = _DRAFT_LABELS.get(t) or t
+    try:
+        await msg.bot.edit_message_text(
+            f"➕ <b>новое правило</b>  ·  шаг 2/3\n\n"
+            f"триггер(ы): <code>{trig_str[:200]}</code>\n"
+            f"добавлено: <b>{count}</b>  ·  последнее: {ic} {lbl}\n\n"
+            f"<blockquote expandable>{summary[:400]}</blockquote>\n\n"
+            f"можешь отправить ещё или нажать <b>готово</b>",
+            chat_id=cid, message_id=mid,
+            reply_markup=kb([
+                b(f"✅ готово ({count})", f"ar_done:{aid}"),
+                b("отмена", f"ar:{aid}:menu"),
+            ]),
+            parse_mode='HTML'
+        )
+    except: pass
+
+
+@router.callback_query(F.data.startswith("ar_done:"), ARState.content)
+async def ar_done(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    prompts = {
-        'text':      "✏️ отправьте текст ответа\n\n(поддерживается HTML-форматирование и премиум-эмодзи)",
-        'voice':     "🎙 отправьте голосовое сообщение",
-        'photo':     "🖼 отправьте фото",
-        'video':     "📹 отправьте видео",
-        'animation': "🎞 отправьте GIF",
-        'document':  "📎 отправьте файл",
-        'audio':     "🎵 отправьте аудио",
-        'sticker':   "😊 отправьте стикер",
-    }
-    prompt = prompts.get(ctype, "отправьте контент")
-    mid = data.get('msg_id'); cid = data.get('chat_id')
-    if ctype == 'text':
-        await state.set_state(ARState.response)
-    else:
-        await state.set_state(ARState.media)
+    aid  = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    items = data.get('ar_items', [])
+    if not items:
+        await cb.answer("⚠️ добавь хотя бы одно сообщение", show_alert=True)
+        return
+    await state.set_state(ARState.match)
+    cid = data['chat_id']; mid = data['msg_id']
+    trig_str = data.get('ar_trig_display', '')
+    import json as _j
+    _, summary, count = _draft_summary(_j.dumps(items))
     try:
         await cb.bot.edit_message_text(
-            f"➕ <b>новое правило</b>  ·  шаг 3/5\n\n"
-            f"триггер: <code>{data['trig']}</code>\n\n{prompt}",
-            chat_id=cid, message_id=mid,
-            reply_markup=kb([b("отмена", f"ar:{data['aid']}:menu")]), parse_mode='HTML'
-        )
-    except: pass
-
-@router.message(ARState.response)
-async def ar_response(msg: Message, state: FSMContext):
-    await delete_user_msg(msg)
-    data = await state.get_data()
-    response_html = msg.html_text or msg.text or ""
-    # Сохраняем entities для корректной отправки через Telethon
-    ents = _serialize_entities(msg)
-    import json as _arj
-    content_json = _arj.dumps(
-        {'type': 'text', 'text': msg.text or '', 'entities': ents, 'html': response_html},
-        ensure_ascii=False
-    )
-    await state.update_data(response=response_html, ar_content_json=content_json)
-    await _ar_ask_buttons(msg.bot, data, response_html)
-
-@router.message(ARState.media)
-async def ar_media(msg: Message, state: FSMContext):
-    await delete_user_msg(msg)
-    data  = await state.get_data()
-    import json as _json
-    content: dict = {}
-    if msg.voice:
-        content = {'type': 'voice', 'file_id': msg.voice.file_id, 'filename': 'voice.ogg', 'caption': ''}
-    elif msg.photo:
-        content = {'type': 'photo', 'file_id': msg.photo[-1].file_id, 'filename': 'photo.jpg',
-                   'caption': msg.html_text or msg.caption or ''}
-    elif msg.video:
-        content = {'type': 'video', 'file_id': msg.video.file_id, 'filename': 'video.mp4',
-                   'caption': msg.html_text or msg.caption or ''}
-    elif msg.animation:
-        content = {'type': 'animation', 'file_id': msg.animation.file_id, 'filename': 'anim.gif',
-                   'caption': msg.html_text or msg.caption or ''}
-    elif msg.audio:
-        content = {'type': 'audio', 'file_id': msg.audio.file_id,
-                   'filename': msg.audio.file_name or 'audio.mp3',
-                   'caption': msg.html_text or msg.caption or ''}
-    elif msg.document:
-        content = {'type': 'document', 'file_id': msg.document.file_id,
-                   'filename': msg.document.file_name or 'file',
-                   'caption': msg.html_text or msg.caption or ''}
-    elif msg.sticker:
-        content = {'type': 'sticker', 'file_id': msg.sticker.file_id, 'filename': 'sticker.webp', 'caption': ''}
-    else:
-        return
-    content_json = _json.dumps(content, ensure_ascii=False)
-    await state.update_data(ar_content_json=content_json, response='')
-    ctype_label = {'voice':'🎙 голос','photo':'🖼 фото','video':'📹 видео',
-                   'animation':'🎞 гиф','audio':'🎵 аудио','document':'📎 файл','sticker':'😊 стикер'}
-    label = ctype_label.get(content['type'], content['type'])
-    await _ar_ask_buttons(msg.bot, data, label)
-
-async def _ar_ask_buttons(bot, data, preview: str):
-    """Шаг 4: предложить добавить кнопки"""
-    mid = data.get('msg_id'); cid = data.get('chat_id'); aid = data.get('aid')
-    # preview может быть HTML (с tg-emoji, bold и т.д.) — показываем в blockquote
-    import html as _hesc
-    preview_block = preview[:500] if preview else '(медиа)'
-    try:
-        await bot.edit_message_text(
-            f"➕ <b>новое правило</b>  ·  шаг 4/5\n\n"
-            f"<blockquote expandable>{preview_block}</blockquote>\n\n"
-            f"добавить URL-кнопки к сообщению?\n"
-            f"<i>кнопки открывают ссылку при нажатии</i>",
-            chat_id=cid, message_id=mid,
-            reply_markup=kb(
-                [b("➕ добавить кнопки", "ar_btn:start")],
-                [b("⏭ пропустить", "ar_btn:skip")]
-            ), parse_mode='HTML'
-        )
-    except: pass
-
-@router.callback_query(F.data.startswith("ar_btn:"))
-async def ar_btn_action(cb: CallbackQuery, state: FSMContext):
-    action = cb.data.split(":")[1]
-    data   = await state.get_data()
-    await cb.answer()
-    if action == "skip":
-        await state.update_data(ar_buttons_json='')
-        await _ar_ask_match(cb.bot, data)
-    elif action == "start":
-        await state.set_state(ARState.btn_add)
-        await state.update_data(ar_buttons_json='', ar_btn_rows=[], ar_btn_cur_row=[])
-        mid = data.get('msg_id'); cid = data.get('chat_id')
-        try:
-            await cb.bot.edit_message_text(
-                "➕ <b>кнопки</b>\n\n"
-                "отправьте кнопку в формате:\n"
-                "<code>текст | https://ссылка</code>\n\n"
-                "каждая кнопка — новая строка = кнопка в той же строке\n"
-                "пустая строка = новая строка кнопок\n\n"
-                "<i>пример:</i>\n"
-                "<code>Google | https://google.com</code>\n"
-                "<code>YouTube | https://youtube.com</code>",
-                chat_id=cid, message_id=mid,
-                reply_markup=kb(
-                    [b("✅ готово (без кнопок)", "ar_btn:done_empty")],
-                    [b("отмена", f"ar:{data['aid']}:menu")]
-                ), parse_mode='HTML'
-            )
-        except: pass
-    elif action in ("done", "done_empty"):
-        await _ar_ask_match(cb.bot, data)
-
-@router.message(ARState.btn_add)
-async def ar_btn_input(msg: Message, state: FSMContext):
-    await delete_user_msg(msg)
-    data = await state.get_data()
-    import json as _json
-    text = (msg.text or '').strip()
-    if not text: return
-    btn_rows = []
-    cur_row  = []
-    for line in (msg.text or '').splitlines():
-        line = line.strip()
-        if not line:
-            if cur_row: btn_rows.append(cur_row); cur_row = []
-        elif '|' in line:
-            parts = line.split('|', 1)
-            btn_text = parts[0].strip()
-            btn_url  = parts[1].strip()
-            if btn_text and btn_url.startswith('http'):
-                cur_row.append({'text': btn_text, 'url': btn_url})
-    if cur_row: btn_rows.append(cur_row)
-    
-    if not btn_rows:
-        await state.update_data(ar_buttons_json='')
-    else:
-        await state.update_data(ar_buttons_json=_json.dumps(btn_rows, ensure_ascii=False))
-    await state.set_state(ARState.match)
-    await _ar_ask_match(msg.bot, data)
-
-async def _ar_ask_match(bot, data):
-    mid = data.get('msg_id'); cid = data.get('chat_id'); aid = data.get('aid')
-    try:
-        await bot.edit_message_text(
-            "➕ <b>новое правило</b>  ·  шаг 5/5\n\n"
-            "тип совпадения триггера:",
+            f"➕ <b>новое правило</b>  ·  шаг 3/3\n\n"
+            f"триггер(ы): <code>{trig_str[:200]}</code>\n"
+            f"сообщений: <b>{count}</b>\n\n"
+            f"<blockquote expandable>{summary[:300]}</blockquote>\n\n"
+            f"тип совпадения триггера:",
             chat_id=cid, message_id=mid,
             reply_markup=kb(
                 [b("📝 содержит", "ar_m:contains"), b("🎯 точное", "ar_m:exact")],
@@ -3545,34 +3536,32 @@ async def _ar_ask_match(bot, data):
                 [b("отмена", f"ar:{aid}:menu")]
             ), parse_mode='HTML'
         )
-        await state.set_state(ARState.match)
     except: pass
 
 @router.callback_query(F.data.startswith("ar_m:"), ARState.match)
 async def ar_match(cb: CallbackQuery, state: FSMContext):
+    import json as _j
     mt   = cb.data.split(":")[1]
     data = await state.get_data()
     aid  = data['aid']
-    t    = data.get('trig', '')
-    r    = data.get('response', '')
-    cj   = data.get('ar_content_json', '')
-    bj   = data.get('ar_buttons_json', '')
+    trig_db  = data.get('ar_trig', '')
+    items    = data.get('ar_items', [])
+    content_json = _j.dumps(items, ensure_ascii=False) if items else ''
     await db_run(
         "INSERT INTO autoreply_rules(account_id,trig,trigger_text,response,response_text,match_type,format_mode,content_json,buttons_json)"
         " VALUES(?,?,?,?,?,?,?,?,?)",
-        (aid, t, t, r, r, mt, 'html', cj, bj)
+        (aid, trig_db, trig_db, '', '', mt, 'html', content_json, '')
     )
     await state.clear()
     await cb.answer()
     mt_labels = {'contains': 'содержит', 'exact': 'точное', 'startswith': 'начинается с'}
-    import json as _j
-    preview = r[:50] if r else (_j.loads(cj).get('type', '?') if cj else '?')
-    btn_note = f"\n🔘 кнопок: {sum(len(row) for row in _j.loads(bj))} шт" if bj else ""
+    trig_display = data.get('ar_trig_display', trig_db)
+    _, summary, count = _draft_summary(content_json) if content_json else ('', '?', 0)
     try:
         await cb.message.edit_text(
             f"✅ <b>правило добавлено</b>\n\n"
-            f"триггер: <code>{t}</code>  ·  <b>{mt_labels.get(mt, mt)}</b>\n"
-            f"ответ: <b>{preview}</b>{btn_note}",
+            f"триггер(ы): <code>{trig_display[:200]}</code>  ·  <b>{mt_labels.get(mt, mt)}</b>\n"
+            f"сообщений: <b>{count}</b>",
             reply_markup=kb([b("📋 правила", f"ar:{aid}:list:0")], [b("‹ назад", f"ar:{aid}:menu")]),
             parse_mode='HTML'
         )
@@ -4282,7 +4271,7 @@ async def ar_schedule_input(msg: Message, state: FSMContext):
         except:
             try:
                 await msg.bot.edit_message_text(
-                    "❌ неверный формат. Пример: <code>09:00-23:00</code>",
+                    "❌ неверный формат. пример: <code>09:00-23:00</code>",
                     chat_id=cid, message_id=mid,
                     reply_markup=kb([b("отмена", f"ar:{aid}:list:0")]), parse_mode='HTML'
                 )
