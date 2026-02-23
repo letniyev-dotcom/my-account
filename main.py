@@ -45,6 +45,7 @@ from telethon.tl.functions.account import (
     UpdateStatusRequest, SetPrivacyRequest, UpdateProfileRequest,
 )
 from telethon.tl.functions.photos import GetUserPhotosRequest, DeletePhotosRequest
+from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import (
     MessageMediaPhoto,
     MessageMediaDocument,
@@ -4598,14 +4599,21 @@ async def cb_mychats(cb: CallbackQuery):
         dialogs = await c.get_dialogs(limit=500)
         for d in dialogs:
             e = d.entity
-            if isinstance(e, Channel):
-                is_channel = e.broadcast
-                is_megagroup = getattr(e, 'megagroup', False)
+            if isinstance(e, (Channel, Chat)):
+                is_channel = isinstance(e, Channel) and e.broadcast
                 uname    = getattr(e, 'username', '') or ''
                 title    = getattr(e, 'title', '') or f"id:{e.id}"
                 members  = getattr(e, 'participants_count', None)
                 dtype    = 'channel' if is_channel else 'group'
-                link     = f"https://t.me/{uname}" if uname else None
+                # Для публичных — прямая ссылка, для приватных — invite link
+                if uname:
+                    link = f"https://t.me/{uname}"
+                else:
+                    try:
+                        inv = await c(ExportChatInviteRequest(e))
+                        link = getattr(inv, 'link', None)
+                    except Exception:
+                        link = None
                 chats.append({
                     'title':   title,
                     'uname':   uname,
@@ -4613,17 +4621,7 @@ async def cb_mychats(cb: CallbackQuery):
                     'members': members,
                     'link':    link,
                     'id':      e.id,
-                })
-            elif isinstance(e, Chat):
-                title   = getattr(e, 'title', '') or f"id:{e.id}"
-                members = getattr(e, 'participants_count', None)
-                chats.append({
-                    'title':   title,
-                    'uname':   '',
-                    'dtype':   'group',
-                    'members': members,
-                    'link':    None,
-                    'id':      e.id,
+                    'private': not bool(uname),
                 })
     except Exception as ex:
         stop.set()
@@ -4649,13 +4647,14 @@ async def cb_mychats(cb: CallbackQuery):
     for ch in chunk:
         ic      = _icons.get(ch['dtype'], '💬')
         name    = ch['title'][:28]
-        tag     = f"  @{ch['uname']}" if ch['uname'] else '  🔒 приватный'
+        tag     = f"  @{ch['uname']}" if ch['uname'] else '  🔒'
         mem_txt = f"  · 👤{_fmt_num(ch['members'])}" if ch['members'] else ''
         lines.append(f"{ic} <b>{name}</b>{tag}{mem_txt}")
-        if ch['link']:
-            rows.append([bu(f"{ic} {name}", ch['link'])])
+        if ch.get('link'):
+            label = f"{ic} {name}" + (" 🔒" if ch.get('private') else "")
+            rows.append([bu(label, ch['link'])])
         else:
-            rows.append([b(f"{ic} {name} (приватный)", f"mychats_info:{aid}:{ch['id']}")])
+            rows.append([b(f"{ic} {name} 🔒 (нет доступа)", f"mychats_info:{aid}:{ch['id']}")])
 
     nav_row = []
     if page > 0:       nav_row.append(b("◀️", f"mychats:{aid}:{page-1}"))
@@ -4688,7 +4687,7 @@ async def cb_mychats_info(cb: CallbackQuery):
         await edit(cb,
             f"{'📢' if is_ch else '👥'} <b>{title}</b>\n"
             f"🔒 приватный {dtype}{mem_txt}\n\n"
-            f"публичная ссылка недоступна — чат приватный",
+            f"🔒 вы не администратор — пригласительную ссылку получить нельзя",
             kb([b("‹ назад", f"mychats:{aid}:0")])
         )
     except Exception as ex:
