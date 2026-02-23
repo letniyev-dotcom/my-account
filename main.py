@@ -628,9 +628,8 @@ class CM:
             return None
         # Проверяем, не заблокирован ли аккаунт
         try:
-            me = await c.get_me()
-            if me is None:
-                await db_run("UPDATE accounts SET active=0 WHERE id=?", (aid,))
+                if me is None:
+                    await db_run("UPDATE accounts SET active=0 WHERE id=?", (aid,))
                 log.warning(f"Account {aid} — get_me() returned None, deactivated")
                 return None
         except Exception as e:
@@ -2594,24 +2593,11 @@ async def _live_analyze_stats(bot, cid: int, mid: int, aid: int) -> None:
             bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
             await _upd(f"📊 <b>анализирую</b> {done}/{total}\n<code>{bar}</code> {pct}%\n👤 {name}")
 
-            total_msgs = inc_cnt = out_cnt = voices_cnt = vn_cnt = media_cnt = 0
+            total_msgs = voices_cnt = vn_cnt = media_cnt = 0
             try:
                 res = await c.get_messages(e, limit=0)
                 total_msgs = getattr(res, "total", 0) or 0
             except Exception: pass
-            await asyncio.sleep(0.07)
-            try:
-                # входящие = от собеседника
-                r_inc = await c.get_messages(e, limit=0, from_user=e)
-                inc_cnt = getattr(r_inc, "total", 0) or 0
-            except Exception: pass
-            await asyncio.sleep(0.07)
-            try:
-                # исходящие = от меня
-                r_out = await c.get_messages(e, limit=0, from_user=me)
-                out_cnt = getattr(r_out, "total", 0) or 0
-            except Exception:
-                out_cnt = max(total_msgs - inc_cnt, 0)
             await asyncio.sleep(0.07)
             try:
                 rv = await c.get_messages(e, limit=0, filter=InputMessagesFilterVoice)
@@ -2636,7 +2622,7 @@ async def _live_analyze_stats(bot, cid: int, mid: int, aid: int) -> None:
                 "voices=excluded.voices,videonotes=excluded.videonotes,"
                 "media_count=excluded.media_count,unread=excluded.unread,"
                 "last_date=excluded.last_date,updated_at=CURRENT_TIMESTAMP",
-                (aid,d.id,name,username,total_msgs,out_cnt,voices_cnt,vn_cnt,media_cnt,d.unread_count or 0,last_str)
+                (aid,d.id,name,username,total_msgs,0,voices_cnt,vn_cnt,media_cnt,d.unread_count or 0,last_str)
             )
             await asyncio.sleep(0.05)
 
@@ -2673,18 +2659,11 @@ async def _render_stats(bot, cid: int, mid: int, aid: int, page: int) -> None:
         tv  = sum(r["voices"] or 0 for r in rows_db)
         tvn = sum(r["videonotes"] or 0 for r in rows_db)
         tmd = sum(r["media_count"] or 0 for r in rows_db)
-        to  = sum(r["out_msgs"] or 0 for r in rows_db)
-        ti  = max(tm - to, 0)
-        ts  = max(tm, 1)
-        pi, po = int(ti/ts*100), int(to/ts*100)
-        bi, bo = _bar(ti, ts, 6), _bar(to, ts, 6)
         unr = f"  🔴{_fmt_num(tu)} непрочит" if tu else ""
         text = (
             f"📊 <b>статистика</b> · {_fmt_num(total_chats)} чатов{unr}\n"
             f"<blockquote>"
             f"💬 {_fmt_num(tm)} сообщений\n"
-            f"📥 {_fmt_num(ti)} вх ({pi}%) <code>{bi}</code>\n"
-            f"📤 {_fmt_num(to)} исх ({po}%) <code>{bo}</code>\n"
             f"🎙 {_fmt_num(tv)}  🎥 {_fmt_num(tvn)}  📎 {_fmt_num(tmd)}"
             f"</blockquote>"
             f"\n<i>👉 листай чаты →</i>"
@@ -2711,28 +2690,23 @@ async def _render_stats(bot, cid: int, mid: int, aid: int, page: int) -> None:
     vo   = r["voices"] or 0
     vn   = r["videonotes"] or 0
     md   = r["media_count"] or 0
-    ts   = max(tm, 1)
-    pi, po = int(ti/ts*100), int(to/ts*100)
-    bi, bo = _bar(ti, ts, 6), _bar(to, ts, 6)
+    ts      = max(tm, 1)
     med_pct = int((vo+vn+md)/ts*100)
 
     uname_part = f" · @{uname}" if uname else ""
     unr_part   = f" · 🔴{unr}" if unr else ""
     pos        = f"{page}/{total_chats}"
 
-    media_line = ""
-    parts = []
-    if vo:  parts.append(f"🎙{_fmt_num(vo)}")
-    if vn:  parts.append(f"🎥{_fmt_num(vn)}")
-    if md:  parts.append(f"📎{_fmt_num(md)}")
-    if parts: media_line = "  ".join(parts) + f"  ({med_pct}%)\n"
+    media_parts = []
+    if vo: media_parts.append(f"🎙{_fmt_num(vo)}")
+    if vn: media_parts.append(f"🎥{_fmt_num(vn)}")
+    if md: media_parts.append(f"📎{_fmt_num(md)}")
+    media_line = ("  ".join(media_parts) + f"  ({med_pct}%)\n") if media_parts else ""
 
     text = (
         f"👤 <b>{name}</b>{uname_part}{unr_part}  <i>· {pos}</i>\n"
         f"<blockquote expandable>"
         f"💬 {_fmt_num(tm)} сообщений\n"
-        f"📥 {_fmt_num(ti)} вх ({pi}%) <code>{bi}</code>\n"
-        f"📤 {_fmt_num(to)} исх ({po}%) <code>{bo}</code>\n"
         f"{media_line}"
         f"🕐 {last}"
         f"</blockquote>"
