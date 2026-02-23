@@ -2544,7 +2544,7 @@ async def _bg_sync_all(aid: int):
 # ══════════════════════════════════════
 # СТАТИСТИКА
 # ══════════════════════════════════════
-_STATS_PAGE = 6   # чатов на страницу
+_STATS_PAGE = 4   # чатов на страницу
 
 def _fmt_num(n) -> str:
     n = int(n or 0)
@@ -2641,12 +2641,21 @@ async def cb_stats(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("stats_refresh:"))
 async def cb_stats_refresh(cb: CallbackQuery):
+    await cb.answer()
     aid = int(cb.data.split(":")[1])
     acc = await db_get("SELECT * FROM accounts WHERE id=? AND user_id=?", (aid, cb.from_user.id))
-    if not acc: await cb.answer("❌"); return
-    await cb.answer("🔄 обновляем...")
-    asyncio.create_task(cm.refresh_stats_cache(aid))
-    await _render_stats(cb.bot, cb.message.chat.id, cb.message.message_id, aid, 0)
+    if not acc: return
+    cid = cb.message.chat.id
+    mid = cb.message.message_id
+    # Показываем статус "обновляем" вместо всплывашки
+    try:
+        await cb.bot.edit_message_text(
+            "🔄 <b>обновляем статистику...</b>\n\nподжди немного, загружаем данные из Telegram",
+            chat_id=cid, message_id=mid, parse_mode='HTML'
+        )
+    except Exception: pass
+    await cm.refresh_stats_cache(aid)
+    await _render_stats(cb.bot, cid, mid, aid, 0)
 
 
 @router.callback_query(F.data == "stats_noop")
@@ -2672,24 +2681,40 @@ async def cb_chat_detail(cb: CallbackQuery):
         (aid, chat_id)
     )
 
-    name     = (sc or {}).get('chat_name') or f"id:{chat_id}"
-    username = (sc or {}).get('username') or ''
-    unread   = (sc or {}).get('unread') or 0
-    last     = (sc or {}).get('last_date') or '—'
-    total_api= (sc or {}).get('total_msgs') or 0
-    inc_c    = (agg or {}).get('inc') or 0
-    out_c    = (agg or {}).get('out') or 0
-    voices   = max((sc or {}).get('voices') or 0, (agg or {}).get('voices') or 0)
-    vn       = max((sc or {}).get('videonotes') or 0, (agg or {}).get('vn') or 0)
-    media    = max((sc or {}).get('media_count') or 0, (agg or {}).get('media') or 0)
-    total    = max(total_api, (agg or {}).get('total') or 0)
+    name      = (sc or {}).get('chat_name') or f"id:{chat_id}"
+    username  = (sc or {}).get('username') or ''
+    unread    = (sc or {}).get('unread') or 0
+    last      = (sc or {}).get('last_date') or '—'
+    total_api = (sc or {}).get('total_msgs') or 0
+    out_api   = (sc or {}).get('out_msgs') or 0
+    inc_api   = max(0, total_api - out_api)
+
+    # msg_cache содержит только сообщения пока бот работал — может быть пустым
+    inc_local   = (agg or {}).get('inc') or 0
+    out_local   = (agg or {}).get('out') or 0
+    total_local = (agg or {}).get('total') or 0
+
+    total = max(total_api, total_local)
+    # Если в local почти ничего — используем данные из API (stats_cache)
+    if total_api > 0 and (total_local == 0 or total_api > total_local * 2):
+        inc_c = inc_api
+        out_c = out_api
+    else:
+        inc_c = max(inc_local, inc_api)
+        out_c = max(out_local, out_api)
+
+    voices = max((sc or {}).get('voices') or 0, (agg or {}).get('voices') or 0)
+    vn     = max((sc or {}).get('videonotes') or 0, (agg or {}).get('vn') or 0)
+    media  = max((sc or {}).get('media_count') or 0, (agg or {}).get('media') or 0)
 
     uname_ln = f"@{username}\n" if username else ""
     unr_ln   = f"🔴 непрочитанных: <b>{unread}</b>\n" if unread else ""
     ts       = max(total, 1)
 
+    total_line = f"💬 всего:     <b>{_fmt_num(total)}</b>\n" if total else ""
     text = (
         f"👤 <b>{name}</b>\n{uname_ln}{unr_ln}\n"
+        f"{total_line}"
         f"📥 входящих:  <code>{_bar(inc_c, ts, 6)}</code> <b>{_fmt_num(inc_c)}</b>\n"
         f"📤 исходящих: <code>{_bar(out_c, ts, 6)}</code> <b>{_fmt_num(out_c)}</b>\n\n"
         f"🎙 голосовых:  <b>{_fmt_num(voices)}</b>\n"
