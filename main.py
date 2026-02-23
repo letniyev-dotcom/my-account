@@ -46,6 +46,9 @@ from telethon.tl.functions.account import (
 )
 from telethon.tl.functions.photos import GetUserPhotosRequest, DeletePhotosRequest
 from telethon.tl.functions.messages import ExportChatInviteRequest
+from telethon.tl.functions.channels import (
+    GetLeftChannelsRequest, GetAdminedPublicChannelsRequest,
+)
 from telethon.tl.types import (
     MessageMediaPhoto,
     MessageMediaDocument,
@@ -4640,10 +4643,97 @@ async def cb_mychats(cb: CallbackQuery):
                     'id':       e.id,
                     'private':  not bool(uname),
                     'archived': archived_flag,
+                    'left':     False,
+                    'creator':  getattr(e, 'creator', False),
                 })
 
         await _collect(False)   # обычные диалоги
         await _collect(True)    # архив
+
+        # Покинутые каналы/группы (в т.ч. где ты создатель)
+        async def _collect_left():
+            offset = 0
+            while True:
+                try:
+                    result = await c(GetLeftChannelsRequest(offset=offset))
+                    left_chats = getattr(result, 'chats', [])
+                    if not left_chats:
+                        break
+                    for e in left_chats:
+                        if not isinstance(e, (Channel, Chat)):
+                            continue
+                        if e.id in seen_ids:
+                            continue
+                        seen_ids.add(e.id)
+                        is_channel   = isinstance(e, Channel) and getattr(e, 'broadcast', False)
+                        is_megagroup = isinstance(e, Channel) and getattr(e, 'megagroup', False)
+                        uname   = getattr(e, 'username', '') or ''
+                        title   = getattr(e, 'title', '') or f"id:{e.id}"
+                        members = getattr(e, 'participants_count', None)
+                        dtype = 'channel' if is_channel else ('megagroup' if is_megagroup else 'group')
+                        if uname:
+                            link = f"https://t.me/{uname}"
+                        else:
+                            link = None
+                            # Для приватных — пробуем получить инвайт-ссылку
+                            # (работает если ты создатель, даже после выхода)
+                            try:
+                                inv  = await c(ExportChatInviteRequest(e))
+                                link = getattr(inv, 'link', None)
+                            except Exception:
+                                pass
+                        chats.append({
+                            'title':    title,
+                            'uname':    uname,
+                            'dtype':    dtype,
+                            'members':  members,
+                            'link':     link,
+                            'id':       e.id,
+                            'private':  not bool(uname),
+                            'archived': False,
+                            'left':     True,
+                            'creator':  getattr(e, 'creator', False),
+                        })
+                    offset += len(left_chats)
+                    if len(left_chats) < 100:
+                        break
+                except Exception:
+                    break
+
+        # Публичные каналы/группы где ты админ (в т.ч. если покинул)
+        async def _collect_admined():
+            try:
+                result = await c(GetAdminedPublicChannelsRequest(by_location=False, check_limit=False))
+                for e in getattr(result, 'chats', []):
+                    if not isinstance(e, (Channel, Chat)):
+                        continue
+                    if e.id in seen_ids:
+                        continue
+                    seen_ids.add(e.id)
+                    is_channel   = isinstance(e, Channel) and getattr(e, 'broadcast', False)
+                    is_megagroup = isinstance(e, Channel) and getattr(e, 'megagroup', False)
+                    uname   = getattr(e, 'username', '') or ''
+                    title   = getattr(e, 'title', '') or f"id:{e.id}"
+                    members = getattr(e, 'participants_count', None)
+                    dtype = 'channel' if is_channel else ('megagroup' if is_megagroup else 'group')
+                    link = f"https://t.me/{uname}" if uname else None
+                    chats.append({
+                        'title':    title,
+                        'uname':    uname,
+                        'dtype':    dtype,
+                        'members':  members,
+                        'link':     link,
+                        'id':       e.id,
+                        'private':  not bool(uname),
+                        'archived': False,
+                        'left':     False,
+                        'creator':  getattr(e, 'creator', False),
+                    })
+            except Exception:
+                pass
+
+        await _collect_left()
+        await _collect_admined()
     except Exception as ex:
         stop.set()
         await edit(cb, f"❌ ошибка загрузки: <code>{ex}</code>",
@@ -4661,19 +4751,24 @@ async def cb_mychats(cb: CallbackQuery):
     chunk = chats[page * per : (page + 1) * per]
 
     _icons = {'channel': '📢', 'group': '👥', 'megagroup': '💬'}
-    page_txt = f"  ·  {page+1}/{pages}" if pages > 1 else ""
+    page_txt       = f"  ·  {page+1}/{pages}" if pages > 1 else ""
     archived_count = sum(1 for ch in chats if ch.get('archived'))
-    arch_txt = f"  ·  📦 {archived_count} архив" if archived_count else ""
-    lines = [f"👥 <b>группы и каналы</b>  ·  {total} чатов{arch_txt}{page_txt}\n"]
+    left_count     = sum(1 for ch in chats if ch.get('left'))
+    arch_txt = f"  📦{archived_count}" if archived_count else ""
+    left_txt = f"  🚪{left_count}" if left_count else ""
+    lines = [f"👥 <b>группы и каналы</b>  ·  {total} чатов{arch_txt}{left_txt}{page_txt}\n"]
 
     rows = []
     for ch in chunk:
-        ic       = _icons.get(ch['dtype'], '💬')
-        name     = ch['title'][:28]
-        tag      = f"  @{ch['uname']}" if ch['uname'] else '  🔒'
-        mem_txt  = f"  · 👤{_fmt_num(ch['members'])}" if ch['members'] else ''
-        arch_lbl = '  📦' if ch.get('archived') else ''
-        lines.append(f"{ic} <b>{name}</b>{tag}{mem_txt}{arch_lbl}")
+        ic         = _icons.get(ch['dtype'], '💬')
+        name       = ch['title'][:28]
+        tag        = f"  @{ch['uname']}" if ch['uname'] else '  🔒'
+        mem_txt    = f"  · 👤{_fmt_num(ch['members'])}" if ch['members'] else ''
+        badges     = ''
+        if ch.get('creator'):  badges += '  👑'
+        if ch.get('left'):     badges += '  🚪'
+        if ch.get('archived'): badges += '  📦'
+        lines.append(f"{ic} <b>{name}</b>{tag}{mem_txt}{badges}")
         if ch.get('link'):
             label = f"{ic} {name}" + (" 🔒" if ch.get('private') else "")
             rows.append([bu(label, ch['link'])])
@@ -4702,18 +4797,39 @@ async def cb_mychats_info(cb: CallbackQuery):
     if not c:
         await edit(cb, "❌ аккаунт не активен", kb([b("‹ назад", f"mychats:{aid}:0")])); return
     try:
-        entity  = await c.get_entity(chat_id)
-        title   = getattr(entity, 'title', '') or f"id:{chat_id}"
-        members = getattr(entity, 'participants_count', None)
-        is_ch   = isinstance(entity, Channel) and entity.broadcast
-        dtype   = 'канал' if is_ch else 'группа/супергруппа'
-        mem_txt = f"\n👤 участников: <b>{_fmt_num(members)}</b>" if members else ''
-        await edit(cb,
-            f"{'📢' if is_ch else '👥'} <b>{title}</b>\n"
-            f"🔒 приватный {dtype}{mem_txt}\n\n"
-            f"🔒 вы не администратор — пригласительную ссылку получить нельзя",
-            kb([b("‹ назад", f"mychats:{aid}:0")])
-        )
+        entity   = await c.get_entity(chat_id)
+        title    = getattr(entity, 'title', '') or f"id:{chat_id}"
+        members  = getattr(entity, 'participants_count', None)
+        is_ch    = isinstance(entity, Channel) and entity.broadcast
+        is_creator = getattr(entity, 'creator', False)
+        dtype    = 'канал' if is_ch else 'группа/супергруппа'
+        ic       = '📢' if is_ch else '👥'
+        mem_txt  = f"\n👤 участников: <b>{_fmt_num(members)}</b>" if members else ''
+        creator_txt = "\n👑 ты создатель" if is_creator else ''
+
+        # Пробуем получить инвайт-ссылку (работает для создателя и админов)
+        invite_link = None
+        try:
+            inv = await c(ExportChatInviteRequest(entity))
+            invite_link = getattr(inv, 'link', None)
+        except Exception:
+            pass
+
+        if invite_link:
+            await edit(cb,
+                f"{ic} <b>{title}</b>\n"
+                f"🔒 приватный {dtype}{mem_txt}{creator_txt}\n\n"
+                f"🔗 <code>{invite_link}</code>",
+                kb([bu("🔗 открыть / пригласить", invite_link)], [b("‹ назад", f"mychats:{aid}:0")])
+            )
+        else:
+            no_link_txt = "🔒 ты не администратор — ссылку получить нельзя" if not is_creator                           else "⚠️ не удалось получить ссылку (возможно, нужно сначала зайти в чат)"
+            await edit(cb,
+                f"{ic} <b>{title}</b>\n"
+                f"🔒 приватный {dtype}{mem_txt}{creator_txt}\n\n"
+                f"{no_link_txt}",
+                kb([b("‹ назад", f"mychats:{aid}:0")])
+            )
     except Exception as ex:
         await edit(cb, f"❌ ошибка: <code>{ex}</code>",
                    kb([b("‹ назад", f"mychats:{aid}:0")]))
